@@ -19,6 +19,9 @@
 - Keep npm metadata, README install commands, GitHub releases, and package
   behavior consistent.
 - Treat generated `dist/`, coverage, and dependency folders as build outputs.
+- `main` is protected by a GitHub ruleset: changes land only through a pull
+  request with the `verify` check green and every review thread resolved.
+  No direct pushes, force-pushes, or branch deletion.
 
 ## Work Guidance
 
