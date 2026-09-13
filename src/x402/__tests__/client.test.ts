@@ -9,6 +9,7 @@ import {
   buildX402PaymentIntentKey,
   canonicalizeX402Amount,
   canonicalizeX402RequestUrl,
+  X402_RECONFIRM_BACKOFF_MS,
   X402_SETTLEMENT_CACHE_LIMIT,
   X402_SETTLEMENT_RETRY_WINDOW_MS,
 } from '../client.js';
@@ -1303,6 +1304,114 @@ describe('X402Client retry idempotency', () => {
 
     expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
     expect(client.getTransactionLog()[0].token.toLowerCase()).toBe(asset.toLowerCase());
+  });
+
+  it('surfaces a revert found by background reconfirmation to the next observer of that intent', async () => {
+    const txA = ('0x' + 'aa'.repeat(32)) as `0x${string}`;
+    const txOther = ('0x' + 'bb'.repeat(32)) as `0x${string}`;
+    const waitReceipt = vi.fn(async ({ hash }: { hash: string }) => {
+      if (hash !== txA) {
+        return { status: 'success' };
+      }
+      const attempt = waitReceipt.mock.calls.filter((call) => call[0].hash === txA).length;
+      if (attempt === 1) {
+        throw new Error('RPC timeout');
+      }
+      if (attempt === 2) {
+        return { status: 'reverted' };
+      }
+      return { status: 'success' };
+    });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockImplementation(async (...args: unknown[]) => {
+        const selected = args[0] as { extra?: { nonce?: string } } | undefined;
+        return { txHash: selected?.extra?.nonce === 'intent-a' ? txA : txOther };
+      });
+    mock402PerIntent();
+    const client = new X402Client(wallet, { globalDailyLimit: 3000000n });
+
+    // intent-a is broadcast but its receipt cannot be observed.
+    expect((await client.fetch(`${url}?n=intent-a`, { method: 'POST' })).status).toBe(200);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+
+    // Unrelated activity reconfirms intent-a in the background and finds the revert.
+    expect((await client.fetch(`${url}?n=intent-b`, { method: 'POST' })).status).toBe(200);
+    await vi.waitFor(() => {
+      expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
+    });
+    expect(client.getDailySpendSummary().global).toBe(1000000n);
+
+    // The next observation of intent-a fails closed instead of paying fresh.
+    await expect(client.fetch(`${url}?n=intent-a`, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementRevertedError,
+    );
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+
+    // Having observed the revert, the caller's own retry settles fresh.
+    expect((await client.fetch(`${url}?n=intent-a`, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(3);
+    expect(client.getDailySpendSummary().global).toBe(2000000n);
+  });
+
+  it('backs off opportunistic reconfirmation while receipts keep failing', async () => {
+    vi.useFakeTimers();
+    const txA = ('0x' + 'aa'.repeat(32)) as `0x${string}`;
+    const txOther = ('0x' + 'bb'.repeat(32)) as `0x${string}`;
+    let failuresForA = 0;
+    const waitReceipt = vi.fn(async ({ hash }: { hash: string }) => {
+      if (hash !== txA) {
+        return { status: 'success' };
+      }
+      failuresForA += 1;
+      if (failuresForA <= 4) {
+        throw new Error('RPC timeout');
+      }
+      return { status: 'success' };
+    });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockImplementation(async (...args: unknown[]) => {
+        const selected = args[0] as { extra?: { nonce?: string } } | undefined;
+        return { txHash: selected?.extra?.nonce === 'intent-a' ? txA : txOther };
+      });
+    mock402PerIntent();
+    const client = new X402Client(wallet);
+    const attemptsForA = () => waitReceipt.mock.calls.filter((call) => call[0].hash === txA).length;
+
+    expect((await client.fetch(`${url}?n=intent-a`, { method: 'POST' })).status).toBe(200);
+    expect(attemptsForA()).toBe(1);
+
+    // First unrelated payment reconfirms immediately; the next two are inside the backoff window.
+    for (const n of ['b', 'c', 'd']) {
+      expect((await client.fetch(`${url}?n=intent-${n}`, { method: 'POST' })).status).toBe(200);
+    }
+    expect(attemptsForA()).toBe(2);
+
+    // After the backoff elapses, activity reconfirms again.
+    vi.advanceTimersByTime(X402_RECONFIRM_BACKOFF_MS + 1);
+    expect((await client.fetch(`${url}?n=intent-e`, { method: 'POST' })).status).toBe(200);
+    expect(attemptsForA()).toBe(3);
+
+    // The window doubles after each failure.
+    vi.advanceTimersByTime(X402_RECONFIRM_BACKOFF_MS + 1);
+    expect((await client.fetch(`${url}?n=intent-f`, { method: 'POST' })).status).toBe(200);
+    expect(attemptsForA()).toBe(3);
+    vi.advanceTimersByTime(X402_RECONFIRM_BACKOFF_MS + 1);
+    expect((await client.fetch(`${url}?n=intent-g`, { method: 'POST' })).status).toBe(200);
+    expect(attemptsForA()).toBe(4);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+
+    // A retry of the intent itself never waits for the backoff: it reconfirms
+    // immediately, and replays the settled hash instead of paying again.
+    expect((await client.fetch(`${url}?n=intent-a`, { method: 'POST' })).status).toBe(200);
+    expect(attemptsForA()).toBe(5);
+    expect(client.getTransactionLog().filter((log) => log.replayed)).toHaveLength(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
   });
 
   it('exports the settlement error classes from both public barrels', async () => {

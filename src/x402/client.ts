@@ -31,6 +31,10 @@ const MAX_PAYMENT_REQUIRED_HEADER_BYTES = 64 * 1024;
 export const X402_SETTLEMENT_CACHE_LIMIT = 256;
 /** Window during which a successful settlement may be replayed for the same intent. */
 export const X402_SETTLEMENT_RETRY_WINDOW_MS = 120_000;
+/** First delay before an `unknown` settlement is reconfirmed opportunistically again. */
+export const X402_RECONFIRM_BACKOFF_MS = 5_000;
+/** Cap on the opportunistic reconfirmation delay. */
+export const X402_RECONFIRM_BACKOFF_MAX_MS = 300_000;
 
 type SettlementConfirmation = 'confirmed' | 'unknown' | 'reverted';
 
@@ -38,21 +42,32 @@ type CachedSettlement = {
   promise: Promise<{ txHash: Hash }>;
   /** Canonical payment terms bound to this explicit intent. */
   termsFingerprint: string;
-  /** null until the receipt is confirmed; otherwise epoch ms when the retry window ends. */
+  /**
+   * null until the receipt outcome is known; otherwise epoch ms when the entry
+   * expires (end of the replay window for `confirmed`, end of the tombstone
+   * window for `reverted`).
+   */
   expiresAt: number | null;
   /**
    * in-flight: policy/broadcast/first receipt still pending.
    * unknown: broadcast, but receipt polling failed; retained (never evicted) and
    *          reconfirmed on later client activity so a revert can be released.
    * confirmed: receipt observed with status success.
+   * reverted: a delayed revert was found by background reconfirmation and no
+   *           caller has observed it yet; the next observation of this intent
+   *           throws instead of silently paying again.
    */
-  status: 'in-flight' | 'unknown' | 'confirmed';
+  status: 'in-flight' | 'unknown' | 'confirmed' | 'reverted';
   /** Submitted transaction hash once execute() returned. */
   txHash?: Hash;
   /** Client-side budget reservation for this settlement; settled or released exactly once. */
   reservationId?: string;
   /** Single-flight receipt reconfirmation for an `unknown` settlement. */
   confirming?: Promise<SettlementConfirmation>;
+  /** Opportunistic reconfirmation is skipped before this time (exponential backoff). */
+  nextReconfirmAt?: number;
+  /** Consecutive reconfirmation attempts that still could not observe a receipt. */
+  reconfirmFailures?: number;
 };
 
 /** Internal: onBeforePayment returned false. Waiters must observe skip, not a second transfer. */
@@ -338,7 +353,16 @@ export class X402Client {
         // Never evicted: dropping an unconfirmed hash is exactly the double-pay
         // hazard. Use this client activity to keep confirming it instead of
         // waiting for the same intent to be retried.
-        this.reconfirmUnknownSettlement(key, entry);
+        this.reconfirmUnknownSettlement(key, entry, now);
+        continue;
+      }
+      if (entry.status === 'reverted') {
+        // Tombstone: kept (outside the completed-entry cap) until the intent is
+        // observed or its window lapses, so a background-detected revert is
+        // surfaced to the caller rather than silently paid again.
+        if (entry.expiresAt !== null && entry.expiresAt <= now) {
+          this.paymentSettlements.delete(key);
+        }
         continue;
       }
       if (entry.expiresAt === null) {
@@ -363,8 +387,16 @@ export class X402Client {
     }
   }
 
-  private reconfirmUnknownSettlement(key: string, entry: CachedSettlement): void {
+  /**
+   * Opportunistic (background) reconfirmation honours exponential backoff so a
+   * sustained RPC outage does not turn every later payment into N extra receipt
+   * requests. A retry of the same intent still reconfirms immediately.
+   */
+  private reconfirmUnknownSettlement(key: string, entry: CachedSettlement, now: number): void {
     if (entry.confirming || !entry.txHash) {
+      return;
+    }
+    if (entry.nextReconfirmAt !== undefined && now < entry.nextReconfirmAt) {
       return;
     }
     void this.confirmSubmittedSettlement(key, entry.txHash).catch(() => undefined);
@@ -373,9 +405,34 @@ export class X402Client {
   private markSettlementConfirmed(entry: CachedSettlement): void {
     entry.status = 'confirmed';
     entry.expiresAt = Date.now() + X402_SETTLEMENT_RETRY_WINDOW_MS;
+    entry.nextReconfirmAt = undefined;
+    entry.reconfirmFailures = undefined;
     if (entry.reservationId) {
       this.budget.settle(entry.reservationId);
     }
+  }
+
+  /**
+   * Record a delayed revert. The reservation is released here, exactly once,
+   * and the entry becomes a tombstone so the next observation of this intent
+   * throws X402SettlementRevertedError instead of paying fresh.
+   */
+  private markSettlementReverted(entry: CachedSettlement): void {
+    entry.status = 'reverted';
+    entry.expiresAt = Date.now() + X402_SETTLEMENT_RETRY_WINDOW_MS;
+    entry.nextReconfirmAt = undefined;
+    if (entry.reservationId) {
+      this.budget.release(entry.reservationId);
+      entry.reservationId = undefined;
+    }
+  }
+
+  /** The caller has now observed the revert; clear the tombstone and fail closed. */
+  private throwObservedRevert(key: string, entry: CachedSettlement, txHash: Hash): never {
+    if (this.paymentSettlements.get(key) === entry) {
+      this.paymentSettlements.delete(key);
+    }
+    throw new X402SettlementRevertedError(txHash);
   }
 
   /**
@@ -418,14 +475,14 @@ export class X402Client {
         return null;
       }
       if (existing.status === 'unknown') {
-        const confirmation = await this.confirmSubmittedSettlement(key, observed.txHash);
-        if (confirmation === 'reverted') {
-          // The original broadcast definitively failed. Its budget reservation
-          // was released exactly once inside the single-flight confirmation and
-          // the entry is evicted. Fail closed here: never start a second
-          // fee+payee transfer on the caller's behalf; the caller decides.
-          throw new X402SettlementRevertedError(observed.txHash);
-        }
+        await this.confirmSubmittedSettlement(key, observed.txHash);
+      }
+      if (existing.status === 'reverted') {
+        // The original broadcast definitively failed (found either by this
+        // retry or by background reconfirmation). Its budget reservation was
+        // released exactly once when the revert was recorded. Fail closed:
+        // never start a second fee+payee transfer on the caller's behalf.
+        this.throwObservedRevert(key, existing, observed.txHash);
       }
       return observed;
     }
@@ -489,8 +546,9 @@ export class X402Client {
    * After a polling error the submitted hash stays cached as `unknown`.
    * Every later observation (a retry of the same intent, or any other client
    * activity via pruneSettlements) shares one confirmation attempt, so a
-   * delayed revert releases the reservation and evicts the entry exactly once,
-   * and a delayed success starts the replay window.
+   * delayed revert releases the reservation exactly once and leaves a
+   * tombstone for the next observer, and a delayed success starts the replay
+   * window.
    */
   private async confirmSubmittedSettlement(
     key: string,
@@ -502,6 +560,9 @@ export class X402Client {
     }
     if (entry.status === 'confirmed') {
       return 'confirmed';
+    }
+    if (entry.status === 'reverted') {
+      return 'reverted';
     }
     if (entry.confirming) {
       return entry.confirming;
@@ -516,14 +577,15 @@ export class X402Client {
         return 'confirmed';
       } catch (receiptError) {
         if (receiptError instanceof X402SettlementRevertedError) {
-          if (this.paymentSettlements.get(key) === entry) {
-            this.paymentSettlements.delete(key);
-          }
-          if (entry.reservationId) {
-            this.budget.release(entry.reservationId);
-          }
+          this.markSettlementReverted(entry);
           return 'reverted';
         }
+        const failures = (entry.reconfirmFailures ?? 0) + 1;
+        entry.reconfirmFailures = failures;
+        entry.nextReconfirmAt = Date.now() + Math.min(
+          X402_RECONFIRM_BACKOFF_MS * 2 ** (failures - 1),
+          X402_RECONFIRM_BACKOFF_MAX_MS,
+        );
         return 'unknown';
       } finally {
         entry.confirming = undefined;
