@@ -1428,6 +1428,42 @@ describe('X402Client retry idempotency', () => {
     expect(executeSpy).toHaveBeenCalledTimes(2);
   });
 
+  it('extends a cached settlement when the same intent is re-issued with a longer timeout', async () => {
+    vi.useFakeTimers();
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    let timeoutSeconds = 30;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      if (headers.get('X-PAYMENT')) {
+        return new Response('paid', { status: 200 });
+      }
+      const challenge = paymentRequired();
+      challenge.accepts[0].maxTimeoutSeconds = timeoutSeconds;
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(challenge)) },
+      });
+    });
+    const client = new X402Client(mockWallet);
+
+    // Settled under a 30s challenge (cached for the 120s default window).
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+
+    // 60s later the server re-issues the same intent with a 300s window.
+    vi.advanceTimersByTime(60_000);
+    timeoutSeconds = 300;
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+
+    // 130s after the original settlement — past the default window, inside the
+    // renewed one — the retry still replays instead of paying again.
+    vi.advanceTimersByTime(70_000);
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.getTransactionLog().filter((log) => log.replayed)).toHaveLength(2);
+  });
+
   it('counts unobserved revert tombstones against the unconfirmed ceiling', async () => {
     const txOther = ('0x' + 'bb'.repeat(32)) as `0x${string}`;
     const revertedHashes = new Set<string>();

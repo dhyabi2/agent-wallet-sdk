@@ -506,6 +506,15 @@ export class X402Client {
       if (existing.termsFingerprint !== termsFingerprint) {
         throw new X402IntentTermsConflictError(key, existing.termsFingerprint, termsFingerprint);
       }
+      // A re-issued challenge may advertise a longer window than the one the
+      // settlement was cached under. Never let the cached deadline be shorter
+      // than the newest window the server is still honouring.
+      if (retryWindowMs > existing.retryWindowMs) {
+        existing.retryWindowMs = retryWindowMs;
+        if (existing.status === 'confirmed' && existing.expiresAt !== null) {
+          existing.expiresAt = Math.max(existing.expiresAt, Date.now() + retryWindowMs);
+        }
+      }
       const observed = await this.observeSettledPayment(existing.promise, true);
       if (!observed) {
         return null;
