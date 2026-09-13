@@ -127,34 +127,96 @@ describe('X402BudgetTracker', () => {
     expect(tracker.checkBudget('new-api.com', 2_000_000n).allowed).toBe(false);
   });
 
-  it('counts reserved spend against daily limits before recordPayment', () => {
-    tracker.reserve('api.example.com', 48_000_000n);
-    const blocked = tracker.checkBudget('api.example.com', 4_000_000n);
-    expect(blocked.allowed).toBe(false);
-    expect(blocked.reason).toContain('daily limit');
-
-    tracker.recordPayment({
+  function reservedLog(amount: bigint, service = 'api.example.com'): X402TransactionLog {
+    return {
       timestamp: Math.floor(Date.now() / 1000),
-      service: 'api.example.com',
-      url: 'https://api.example.com/data',
-      amount: 48_000_000n,
+      service,
+      url: `https://${service}/data`,
+      amount,
       token: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as `0x${string}`,
       recipient: '0x1234567890abcdef1234567890abcdef12345678' as `0x${string}`,
       txHash: '0xabc123' as `0x${string}`,
       network: 'base:8453',
       scheme: 'exact',
       success: true,
-    });
+    };
+  }
+
+  it('counts reserved spend against daily limits before recordPayment', () => {
+    const reservationId = tracker.reserve('api.example.com', 48_000_000n);
+    const blocked = tracker.checkBudget('api.example.com', 4_000_000n);
+    expect(blocked.allowed).toBe(false);
+    expect(blocked.reason).toContain('daily limit');
+
+    tracker.recordPayment(reservedLog(48_000_000n), { reserved: true });
+    expect(tracker.settle(reservationId)).toBe(true);
 
     expect(tracker.getDailySpendSummary().global).toBe(48_000_000n);
     expect(tracker.getDailySpendSummary().byService['api.example.com']).toBe(48_000_000n);
+    expect(tracker.getReservedSummary().global).toBe(0n);
   });
 
   it('releases a reservation when settlement reverts', () => {
-    tracker.reserve('api.example.com', 4_000_000n);
+    const reservationId = tracker.reserve('api.example.com', 4_000_000n);
     expect(tracker.getDailySpendSummary().global).toBe(4_000_000n);
-    tracker.release('api.example.com', 4_000_000n);
+    expect(tracker.release(reservationId)).toBe(true);
     expect(tracker.getDailySpendSummary().global).toBe(0n);
     expect(tracker.checkBudget('api.example.com', 4_000_000n).allowed).toBe(true);
+  });
+
+  it('releases a reservation at most once even with concurrent observers', () => {
+    tracker.recordPayment(reservedLog(3_000_000n, 'other.example.com'));
+    const reservationId = tracker.reserve('api.example.com', 4_000_000n);
+    expect(tracker.getDailySpendSummary().global).toBe(7_000_000n);
+
+    expect(tracker.release(reservationId)).toBe(true);
+    expect(tracker.release(reservationId)).toBe(false);
+    expect(tracker.settle(reservationId)).toBe(false);
+
+    expect(tracker.getDailySpendSummary().global).toBe(3_000_000n);
+    expect(tracker.getDailySpendSummary().byService['other.example.com']).toBe(3_000_000n);
+    expect(tracker.getDailySpendSummary().byService['api.example.com']).toBe(0n);
+  });
+
+  it('only releases the reservation that belongs to the reverted payment', () => {
+    const pending = tracker.reserve('api.example.com', 10_000_000n);
+    const unkeyed = tracker.reserve('api.example.com', 5_000_000n);
+    tracker.recordPayment(reservedLog(5_000_000n), { reserved: true });
+    tracker.settle(unkeyed);
+    expect(tracker.getDailySpendSummary().byService['api.example.com']).toBe(15_000_000n);
+
+    tracker.release(pending);
+    expect(tracker.getDailySpendSummary().byService['api.example.com']).toBe(5_000_000n);
+    expect(tracker.getDailySpendSummary().global).toBe(5_000_000n);
+  });
+
+  it('never subtracts a previous budget day\'s reservation from the new day', () => {
+    const realNow = Date.now;
+    try {
+      const dayStart = Math.floor(realNow() / 86_400_000) * 86_400_000;
+      Date.now = () => dayStart + 60_000;
+      const staleTracker = new X402BudgetTracker({ globalDailyLimit: 100_000_000n });
+      const reservationId = staleTracker.reserve('api.example.com', 4_000_000n);
+
+      Date.now = () => dayStart + 86_400_000 + 60_000;
+      staleTracker.recordPayment(reservedLog(2_000_000n, 'other.example.com'));
+      expect(staleTracker.getDailySpendSummary().global).toBe(2_000_000n);
+
+      expect(staleTracker.release(reservationId)).toBe(false);
+      expect(staleTracker.getDailySpendSummary().global).toBe(2_000_000n);
+      expect(staleTracker.getDailySpendSummary().byService['other.example.com']).toBe(2_000_000n);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it('checks and reserves atomically', () => {
+    const first = tracker.checkAndReserve('api.example.com', 5_000_000n);
+    expect(first.allowed).toBe(true);
+    expect(tracker.getDailySpendSummary().byService['api.example.com']).toBe(5_000_000n);
+
+    const overLimit = tracker.checkAndReserve('api.example.com', 6_000_000n);
+    expect(overLimit.allowed).toBe(false);
+    expect(tracker.getDailySpendSummary().byService['api.example.com']).toBe(5_000_000n);
   });
 });

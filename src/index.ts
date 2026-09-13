@@ -36,6 +36,8 @@ export {
   X402BudgetTracker,
   X402PaymentError,
   X402BudgetExceededError,
+  X402SettlementRevertedError,
+  X402IntentTermsConflictError,
   createX402Client,
   createX402Fetch,
   wrapWithX402,
