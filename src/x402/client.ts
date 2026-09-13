@@ -51,6 +51,16 @@ export const X402_RECONFIRM_BACKOFF_MAX_MS = 300_000;
 
 type SettlementConfirmation = 'confirmed' | 'unknown' | 'reverted';
 
+/** 0.77% protocol fee charged beside the payee transfer. */
+const X402_PROTOCOL_FEE_BPS = 77n;
+const X402_PROTOCOL_FEE_COLLECTOR: Address =
+  '0xff86829393C6C26A4EC122bE0Cc3E466Ef876AdD';
+
+type CachedFeePhase = {
+  txHash: Hash;
+  termsFingerprint: string;
+};
+
 type CachedSettlement = {
   promise: Promise<{ txHash: Hash }>;
   /** Canonical payment terms bound to this explicit intent. */
@@ -206,6 +216,8 @@ export class X402Client {
   private budget: X402BudgetTracker;
   private supportedNetworks: Set<string>;
   private paymentSettlements = new Map<string, CachedSettlement>();
+  /** Confirmed protocol-fee hashes keyed by explicit intent; survives payee-revert eviction. */
+  private feePhases = new Map<string, CachedFeePhase>();
   private unkeyedIntentSequence = 0;
 
   constructor(wallet: any, config: X402ClientConfig = {}) {
@@ -292,7 +304,7 @@ export class X402Client {
       ? await this.settlePayment(
           buildX402PaymentIntentKey(method, urlStr, explicitIntent),
           buildX402PaymentTermsFingerprint(selected),
-          () => this.executePayment(selected),
+          (intent) => this.executePayment(selected, intent),
           authorizeFreshTransfer,
           Math.max(X402_SETTLEMENT_RETRY_WINDOW_MS, selected.maxTimeoutSeconds * 1000),
         )
@@ -496,11 +508,19 @@ export class X402Client {
   private async settlePayment(
     key: string,
     termsFingerprint: string,
-    execute: () => Promise<{ txHash: Hash }>,
+    execute: (intent: { key: string; termsFingerprint: string }) => Promise<{ txHash: Hash }>,
     authorize: AuthorizeFreshTransfer,
     retryWindowMs: number = X402_SETTLEMENT_RETRY_WINDOW_MS,
   ): Promise<{ txHash: Hash; replayed: boolean; entry: CachedSettlement } | null> {
     this.pruneSettlements();
+    const existingFee = this.feePhases.get(key);
+    if (existingFee && existingFee.termsFingerprint !== termsFingerprint) {
+      throw new X402IntentTermsConflictError(
+        key,
+        existingFee.termsFingerprint,
+        termsFingerprint,
+      );
+    }
     const existing = this.paymentSettlements.get(key);
     if (existing) {
       if (existing.termsFingerprint !== termsFingerprint) {
@@ -526,7 +546,8 @@ export class X402Client {
         // The original broadcast definitively failed (found either by this
         // retry or by background reconfirmation). Its budget reservation was
         // released exactly once when the revert was recorded. Fail closed:
-        // never start a second fee+payee transfer on the caller's behalf.
+        // never auto-retry a confirmed revert. A later caller-initiated
+        // attempt may resume the payee transfer without re-charging the fee.
         this.throwObservedRevert(key, existing, observed.txHash);
       }
       return { ...observed, entry: existing };
@@ -561,7 +582,7 @@ export class X402Client {
         entry.reservationId = reservationId;
         let result: { txHash: Hash };
         try {
-          result = await execute();
+          result = await execute({ key, termsFingerprint });
         } catch (error) {
           // No hash was returned, so nothing is tracked on-chain for this
           // intent; give the reserved spend back.
@@ -802,7 +823,10 @@ export class X402Client {
    * v6 change: resolves asset address via TokenRegistry before executing.
    * The 402 response may specify an asset by symbol ("USDC") or by address.
    */
-  private async executePayment(req: X402PaymentRequirements): Promise<{ txHash: Hash }> {
+  private async executePayment(
+    req: X402PaymentRequirements,
+    intent?: { key: string; termsFingerprint: string },
+  ): Promise<{ txHash: Hash }> {
     // Resolve the actual contract address for the requested asset
     const resolvedAddress = resolveAssetAddress(req.asset, req.network);
     if (!resolvedAddress) {
@@ -830,17 +854,33 @@ export class X402Client {
       );
     }
 
-    // Calculate and transfer protocol fee (0.77% = 77 bps)
-    const X402_PROTOCOL_FEE_BPS = 77n;
-    const FEE_COLLECTOR: Address = '0xff86829393C6C26A4EC122bE0Cc3E466Ef876AdD';
     const feeAmount = (amount * X402_PROTOCOL_FEE_BPS) / 10000n;
 
     if (feeAmount > 0n) {
-      await agentTransferToken(this.wallet, {
-        token: req.asset as Address,
-        to: FEE_COLLECTOR,
-        amount: feeAmount,
-      });
+      const recordedFee = intent ? this.feePhases.get(intent.key) : undefined;
+      if (recordedFee && recordedFee.termsFingerprint !== intent!.termsFingerprint) {
+        throw new X402IntentTermsConflictError(
+          intent!.key,
+          recordedFee.termsFingerprint,
+          intent!.termsFingerprint,
+        );
+      }
+      if (!recordedFee) {
+        const feeTxHash = await agentTransferToken(this.wallet, {
+          token: resolvedAddress,
+          to: X402_PROTOCOL_FEE_COLLECTOR,
+          amount: feeAmount,
+        });
+        // Fail closed: do not start the payee transfer until the fee receipt
+        // is confirmed, and do not skip a later fee unless this one landed.
+        await this.waitForSettlementReceipt(feeTxHash);
+        if (intent) {
+          this.feePhases.set(intent.key, {
+            txHash: feeTxHash,
+            termsFingerprint: intent.termsFingerprint,
+          });
+        }
+      }
     }
 
     // Execute the ERC20 transfer via AgentWallet (full amount to payee)
