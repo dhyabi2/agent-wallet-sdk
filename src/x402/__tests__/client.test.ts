@@ -9,9 +9,10 @@ import {
   buildX402PaymentIntentKey,
   canonicalizeX402Amount,
   canonicalizeX402RequestUrl,
+  X402_MAX_UNCONFIRMED_SETTLEMENTS,
   X402_RECONFIRM_BACKOFF_MS,
-  X402_SETTLEMENT_CACHE_LIMIT,
   X402_SETTLEMENT_RETRY_WINDOW_MS,
+  X402SettlementBacklogError,
 } from '../client.js';
 import { USDC_ADDRESSES } from '../types.js';
 import type { X402PaymentRequired, X402PaymentRequirements } from '../types.js';
@@ -726,132 +727,6 @@ describe('X402Client retry idempotency', () => {
     expect(client.getDailySpendSummary().global).toBe(1000000n);
   });
 
-  it('evicts the oldest completed settlement once the cache is full',
-    async () => {
-      const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
-        .mockResolvedValue({ txHash });
-      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
-        const headers = new Headers(init?.headers);
-        if (headers.get('X-PAYMENT')) {
-          return new Response('paid', { status: 200 });
-        }
-        const requested = String(input);
-        const nonce = new URL(requested).searchParams.get('n') ?? 'missing';
-        return new Response(null, {
-          status: 402,
-          headers: {
-            'payment-required': btoa(JSON.stringify({
-              x402Version: 1,
-              resource: {
-                url: new URL(requested).pathname,
-                description: 'Data API',
-                mimeType: 'application/json',
-              },
-              accepts: [
-                {
-                  scheme: 'exact',
-                  network: 'base:8453',
-                  asset,
-                  amount: '1000000',
-                  payTo,
-                  maxTimeoutSeconds: 30,
-                  extra: { nonce },
-                },
-              ],
-            })),
-          },
-        });
-      });
-      const client = new X402Client(mockWallet);
-      const firstUrl = `${url}?n=intent-0`;
-
-      for (let i = 0; i <= X402_SETTLEMENT_CACHE_LIMIT; i++) {
-        const response = await client.fetch(`${url}?n=intent-${i}`, { method: 'POST' });
-        expect(response.status).toBe(200);
-      }
-
-      const overflowCalls = executeSpy.mock.calls.length;
-      expect(overflowCalls).toBe(X402_SETTLEMENT_CACHE_LIMIT + 1);
-
-      const replayAfterEviction = await client.fetch(firstUrl, { method: 'POST' });
-      expect(replayAfterEviction.status).toBe(200);
-      expect(executeSpy).toHaveBeenCalledTimes(overflowCalls + 1);
-    },
-  );
-
-  it('does not evict a completed settlement because in-flight entries exceed the cache limit',
-    async () => {
-      const releases = new Map<string, (value: { txHash: `0x${string}` }) => void>();
-      const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
-        .mockImplementation(async (...args: unknown[]) => {
-          const selected = args[0] as { extra?: { nonce?: string } } | undefined;
-          const nonce = String(selected?.extra?.nonce ?? '');
-          return new Promise<{ txHash: `0x${string}` }>((resolve) => {
-            releases.set(nonce, resolve);
-          });
-        });
-      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
-        const headers = new Headers(init?.headers);
-        if (headers.get('X-PAYMENT')) {
-          return new Response('paid', { status: 200 });
-        }
-        const requested = String(input);
-        const nonce = new URL(requested).searchParams.get('n') ?? 'missing';
-        return new Response(null, {
-          status: 402,
-          headers: {
-            'payment-required': btoa(JSON.stringify({
-              x402Version: 1,
-              resource: {
-                url: new URL(requested).pathname,
-                description: 'Data API',
-                mimeType: 'application/json',
-              },
-              accepts: [
-                {
-                  scheme: 'exact',
-                  network: 'base:8453',
-                  asset,
-                  amount: '1000000',
-                  payTo,
-                  maxTimeoutSeconds: 30,
-                  extra: { nonce },
-                },
-              ],
-            })),
-          },
-        });
-      });
-      const client = new X402Client(mockWallet);
-      const firstUrl = `${url}?n=intent-0`;
-      const inflight = X402_SETTLEMENT_CACHE_LIMIT + 1;
-      const pending = Array.from({ length: inflight }, (_, i) => (
-        client.fetch(`${url}?n=intent-${i}`, { method: 'POST' })
-      ));
-
-      await vi.waitFor(() => {
-        expect(releases.size).toBe(inflight);
-      });
-      const releaseFirst = releases.get('intent-0');
-      expect(releaseFirst).toBeTypeOf('function');
-      releaseFirst!({ txHash });
-      expect((await pending[0]).status).toBe(200);
-
-      const replay = await client.fetch(firstUrl, { method: 'POST' });
-      expect(replay.status).toBe(200);
-      expect(executeSpy).toHaveBeenCalledTimes(inflight);
-      expect(client.getTransactionLog().filter((log) => log.replayed)).toHaveLength(1);
-
-      for (const [nonce, release] of releases) {
-        if (nonce !== 'intent-0') {
-          release({ txHash });
-        }
-      }
-      const remaining = await Promise.all(pending.slice(1));
-      expect(remaining.every((response) => response.status === 200)).toBe(true);
-    },
-  );
-
   it('reuses a submitted settlement until the receipt is final', async () => {
     let releaseReceipt: (value: { status: string }) => void = () => {};
     const receiptGate = new Promise<{ status: string }>((resolve) => {
@@ -953,12 +828,15 @@ describe('X402Client retry idempotency', () => {
     expect(executeSpy).toHaveBeenCalledTimes(1);
     expect(waitReceipt).toHaveBeenCalledTimes(2);
 
-    // The caller's own retry settles fresh.
+    // The caller's own retry settles fresh. The log carries the original
+    // observation, the correction for the revert, and the fresh settlement.
     expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
     expect(executeSpy).toHaveBeenCalledTimes(2);
     expect(waitReceipt).toHaveBeenCalledTimes(3);
-    expect(client.getTransactionLog()).toHaveLength(2);
-    expect(client.getTransactionLog()[1].replayed).toBe(false);
+    const logs = client.getTransactionLog();
+    expect(logs).toHaveLength(3);
+    expect(logs.map((log) => log.success)).toEqual([true, false, true]);
+    expect(logs[2].replayed).toBe(false);
   });
 
   it('releases reserved daily budget exactly once when a delayed revert is confirmed', async () => {
@@ -1188,52 +1066,24 @@ describe('X402Client retry idempotency', () => {
     expect(client.getDailySpendSummary().global).toBe(1000000n);
   });
 
-  it('evicts by completion time, not insertion order, when the cache is full', async () => {
-    const releases = new Map<string, (value: { txHash: `0x${string}` }) => void>();
+  it('retains every completed settlement for the full retry window regardless of count', async () => {
     const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
-      .mockImplementation(async (...args: unknown[]) => {
-        const selected = args[0] as { extra?: { nonce?: string } } | undefined;
-        const nonce = String(selected?.extra?.nonce ?? '');
-        return new Promise<{ txHash: `0x${string}` }>((resolve) => {
-          releases.set(nonce, resolve);
-        });
-      });
+      .mockResolvedValue({ txHash });
     mock402PerIntent();
     const client = new X402Client(mockWallet);
-    const firstUrl = `${url}?n=intent-0`;
-    const untilStarted = async (nonce: string) => {
-      for (let i = 0; i < 1000 && !releases.has(nonce); i++) {
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
-      expect(releases.has(nonce)).toBe(true);
-    };
+    const count = 300;
 
-    // intent-0 is inserted first but completes last.
-    const firstPromise = client.fetch(firstUrl, { method: 'POST' });
-    await untilStarted('intent-0');
-    for (let i = 1; i <= X402_SETTLEMENT_CACHE_LIMIT; i++) {
-      const pending = client.fetch(`${url}?n=intent-${i}`, { method: 'POST' });
-      await untilStarted(`intent-${i}`);
-      releases.get(`intent-${i}`)!({ txHash });
-      expect((await pending).status).toBe(200);
+    for (let i = 0; i < count; i++) {
+      expect((await client.fetch(`${url}?n=intent-${i}`, { method: 'POST' })).status).toBe(200);
     }
-    releases.get('intent-0')!({ txHash });
-    expect((await firstPromise).status).toBe(200);
-    const transfersSoFar = executeSpy.mock.calls.length;
-    expect(transfersSoFar).toBe(X402_SETTLEMENT_CACHE_LIMIT + 1);
+    expect(executeSpy).toHaveBeenCalledTimes(count);
 
-    // intent-0 just completed, so it must still be replayable; intent-1 (the
-    // earliest completion) is the one that was evicted.
-    const replayFirst = await client.fetch(firstUrl, { method: 'POST' });
-    expect(replayFirst.status).toBe(200);
-    expect(executeSpy).toHaveBeenCalledTimes(transfersSoFar);
-
-    const evictedPromise = client.fetch(`${url}?n=intent-1`, { method: 'POST' });
-    await vi.waitFor(() => {
-      expect(executeSpy).toHaveBeenCalledTimes(transfersSoFar + 1);
-    });
-    releases.get('intent-1')!({ txHash });
-    expect((await evictedPromise).status).toBe(200);
+    // Every intent, including the very first, still replays inside its window.
+    for (const i of [0, 1, count - 1]) {
+      expect((await client.fetch(`${url}?n=intent-${i}`, { method: 'POST' })).status).toBe(200);
+    }
+    expect(executeSpy).toHaveBeenCalledTimes(count);
+    expect(client.getTransactionLog().filter((log) => log.replayed)).toHaveLength(3);
   });
 
   it('emits collision-free idempotency keys for delimiter-containing fields', () => {
@@ -1414,13 +1264,119 @@ describe('X402Client retry idempotency', () => {
     expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
   });
 
+  it('retains a revert tombstone until the intent is observed, even past the replay window', async () => {
+    vi.useFakeTimers();
+    const txA = ('0x' + 'aa'.repeat(32)) as `0x${string}`;
+    const txOther = ('0x' + 'bb'.repeat(32)) as `0x${string}`;
+    const waitReceipt = vi.fn(async ({ hash }: { hash: string }) => {
+      if (hash !== txA) {
+        return { status: 'success' };
+      }
+      const attempt = waitReceipt.mock.calls.filter((call) => call[0].hash === txA).length;
+      if (attempt === 1) {
+        throw new Error('RPC timeout');
+      }
+      return { status: 'reverted' };
+    });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockImplementation(async (...args: unknown[]) => {
+        const selected = args[0] as { extra?: { nonce?: string } } | undefined;
+        return { txHash: selected?.extra?.nonce === 'intent-a' ? txA : txOther };
+      });
+    mock402PerIntent();
+    const client = new X402Client(wallet);
+
+    expect((await client.fetch(`${url}?n=intent-a`, { method: 'POST' })).status).toBe(200);
+    expect((await client.fetch(`${url}?n=intent-b`, { method: 'POST' })).status).toBe(200);
+    await vi.waitFor(() => {
+      expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
+    });
+
+    // Well past the replay window, and with more unrelated activity in between,
+    // the first observation of intent-a still fails closed.
+    vi.advanceTimersByTime(X402_SETTLEMENT_RETRY_WINDOW_MS * 10);
+    expect((await client.fetch(`${url}?n=intent-c`, { method: 'POST' })).status).toBe(200);
+    await expect(client.fetch(`${url}?n=intent-a`, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementRevertedError,
+    );
+    expect(executeSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it('appends a corrective log and callback when a delayed revert is confirmed', async () => {
+    const waitReceipt = vi.fn()
+      .mockRejectedValueOnce(new Error('RPC timeout'))
+      .mockResolvedValueOnce({ status: 'reverted' })
+      .mockResolvedValue({ status: 'success' });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    vi.spyOn(X402Client.prototype as any, 'executePayment').mockResolvedValue({ txHash });
+    const completions: Array<{ success: boolean; txHash: string; error?: string }> = [];
+    mock402ThenPaid();
+    const client = new X402Client(wallet, {
+      onPaymentComplete: (log) => {
+        completions.push({ success: log.success, txHash: log.txHash, error: log.error });
+      },
+    });
+
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(completions).toEqual([{ success: true, txHash, error: undefined }]);
+
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementRevertedError,
+    );
+    const logs = client.getTransactionLog();
+    expect(logs).toHaveLength(2);
+    expect(logs[1]).toMatchObject({ txHash, success: false, replayed: false });
+    expect(logs[1].error).toMatch(/reverted/);
+    expect(logs[1].idempotencyKey).toBe(logs[0].idempotencyKey);
+    expect(completions).toHaveLength(2);
+    expect(completions[1]).toMatchObject({ success: false, txHash });
+    expect(client.getDailySpendSummary().global).toBe(0n);
+  });
+
+  it('refuses new explicit-intent transfers once the unconfirmed backlog reaches the ceiling', async () => {
+    const waitReceipt = vi.fn(async () => {
+      throw new Error('RPC down');
+    });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    mock402PerIntent();
+    const client = new X402Client(wallet);
+
+    for (let i = 0; i < X402_MAX_UNCONFIRMED_SETTLEMENTS; i++) {
+      expect((await client.fetch(`${url}?n=intent-${i}`, { method: 'POST' })).status).toBe(200);
+    }
+    expect(executeSpy).toHaveBeenCalledTimes(X402_MAX_UNCONFIRMED_SETTLEMENTS);
+
+    // At the ceiling: no new broadcast, no new reservation, nothing evicted.
+    await expect(client.fetch(`${url}?n=intent-overflow`, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementBacklogError,
+    );
+    expect(executeSpy).toHaveBeenCalledTimes(X402_MAX_UNCONFIRMED_SETTLEMENTS);
+    expect(client.budgetTracker.getReservedSummary().global)
+      .toBe(BigInt(X402_MAX_UNCONFIRMED_SETTLEMENTS) * 1000000n);
+
+    // A retry of an already-submitted intent is still served (and reconfirmed).
+    await expect(client.fetch(`${url}?n=intent-0`, { method: 'POST' })).resolves.toMatchObject({ status: 200 });
+    expect(executeSpy).toHaveBeenCalledTimes(X402_MAX_UNCONFIRMED_SETTLEMENTS);
+  });
+
   it('exports the settlement error classes from both public barrels', async () => {
     const x402Barrel = await import('../index.js');
     const rootBarrel = await import('../../index.js');
     expect(x402Barrel.X402SettlementRevertedError).toBe(X402SettlementRevertedError);
     expect(x402Barrel.X402IntentTermsConflictError).toBe(X402IntentTermsConflictError);
+    expect(x402Barrel.X402SettlementBacklogError).toBe(X402SettlementBacklogError);
     expect(rootBarrel.X402SettlementRevertedError).toBe(X402SettlementRevertedError);
     expect(rootBarrel.X402IntentTermsConflictError).toBe(X402IntentTermsConflictError);
+    expect(rootBarrel.X402SettlementBacklogError).toBe(X402SettlementBacklogError);
   });
 });
 

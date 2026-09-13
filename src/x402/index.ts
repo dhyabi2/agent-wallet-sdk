@@ -4,6 +4,7 @@ export {
   X402PaymentError,
   X402BudgetExceededError,
   X402SettlementRevertedError,
+  X402SettlementBacklogError,
   X402IntentTermsConflictError,
 } from './client.js';
 export { X402BudgetTracker } from './budget.js';

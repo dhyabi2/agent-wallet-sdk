@@ -27,10 +27,20 @@ import { resolveAssetAddress } from './multi-asset.js';
 
 const MAX_PAYMENT_REQUIRED_HEADER_BYTES = 64 * 1024;
 
-/** Max completed settlements retained for retry replay. In-flight entries are never evicted. */
-export const X402_SETTLEMENT_CACHE_LIMIT = 256;
-/** Window during which a successful settlement may be replayed for the same intent. */
+/**
+ * Window during which a successful settlement may be replayed for the same
+ * intent. Every completed settlement is retained for the full window — the
+ * cache is bounded by throughput × window, never by a count that could evict
+ * an intent whose advertised retry window has not ended.
+ */
 export const X402_SETTLEMENT_RETRY_WINDOW_MS = 120_000;
+/**
+ * Fail-closed ceiling on settlements whose receipt could not be observed.
+ * Unconfirmed hashes are never evicted (that is the double-pay hazard); once
+ * this many are outstanding the client refuses to broadcast new explicit-intent
+ * transfers until confirmations resume.
+ */
+export const X402_MAX_UNCONFIRMED_SETTLEMENTS = 1024;
 /** First delay before an `unknown` settlement is reconfirmed opportunistically again. */
 export const X402_RECONFIRM_BACKOFF_MS = 5_000;
 /** Cap on the opportunistic reconfirmation delay. */
@@ -43,9 +53,8 @@ type CachedSettlement = {
   /** Canonical payment terms bound to this explicit intent. */
   termsFingerprint: string;
   /**
-   * null until the receipt outcome is known; otherwise epoch ms when the entry
-   * expires (end of the replay window for `confirmed`, end of the tombstone
-   * window for `reverted`).
+   * null until the receipt is confirmed successful; otherwise epoch ms when
+   * the replay window ends. `unknown` and `reverted` entries never expire.
    */
   expiresAt: number | null;
   /**
@@ -54,14 +63,19 @@ type CachedSettlement = {
    *          reconfirmed on later client activity so a revert can be released.
    * confirmed: receipt observed with status success.
    * reverted: a delayed revert was found by background reconfirmation and no
-   *           caller has observed it yet; the next observation of this intent
-   *           throws instead of silently paying again.
+   *           caller has observed it yet; retained until the next observation
+   *           of this intent, which throws instead of silently paying again.
    */
   status: 'in-flight' | 'unknown' | 'confirmed' | 'reverted';
   /** Submitted transaction hash once execute() returned. */
   txHash?: Hash;
   /** Client-side budget reservation for this settlement; settled or released exactly once. */
   reservationId?: string;
+  /**
+   * The success observation the original caller recorded while the receipt
+   * was still unknown; a delayed revert appends a corrective entry from it.
+   */
+  log?: X402TransactionLog;
   /** Single-flight receipt reconfirmation for an `unknown` settlement. */
   confirming?: Promise<SettlementConfirmation>;
   /** Opportunistic reconfirmation is skipped before this time (exponential backoff). */
@@ -317,6 +331,10 @@ export class X402Client {
     // settlement path settles or releases that reservation once the receipt
     // outcome is known. Replays never change totals.
     this.budget.recordPayment(log, { reserved: !replayed });
+    if (paymentResult.entry && !replayed) {
+      // Kept so a delayed revert can append a corrective observation.
+      paymentResult.entry.log = log;
+    }
     this.config.onPaymentComplete?.(log);
 
     // Retry request with payment proof
@@ -346,45 +364,29 @@ export class X402Client {
       .slice(2, 10)}`;
   }
 
-  private pruneSettlements(now = Date.now()): void {
-    const completed: Array<{ key: string; expiresAt: number }> = [];
+  /**
+   * Drop confirmed settlements whose replay window has ended and reconfirm
+   * unknown ones. Nothing else is ever evicted: a confirmed entry lives for its
+   * full advertised window, an unknown hash is retained until its receipt is
+   * observed, and a revert tombstone is retained until a caller observes it.
+   * Returns the number of unconfirmed settlements currently retained.
+   */
+  private pruneSettlements(now = Date.now()): number {
+    let unconfirmed = 0;
     for (const [key, entry] of this.paymentSettlements) {
       if (entry.status === 'unknown') {
+        unconfirmed += 1;
         // Never evicted: dropping an unconfirmed hash is exactly the double-pay
         // hazard. Use this client activity to keep confirming it instead of
         // waiting for the same intent to be retried.
         this.reconfirmUnknownSettlement(key, entry, now);
         continue;
       }
-      if (entry.status === 'reverted') {
-        // Tombstone: kept (outside the completed-entry cap) until the intent is
-        // observed or its window lapses, so a background-detected revert is
-        // surfaced to the caller rather than silently paid again.
-        if (entry.expiresAt !== null && entry.expiresAt <= now) {
-          this.paymentSettlements.delete(key);
-        }
-        continue;
-      }
-      if (entry.expiresAt === null) {
-        continue;
-      }
-      if (entry.expiresAt <= now) {
+      if (entry.status === 'confirmed' && entry.expiresAt !== null && entry.expiresAt <= now) {
         this.paymentSettlements.delete(key);
-        continue;
       }
-      completed.push({ key, expiresAt: entry.expiresAt });
     }
-    const overflow = completed.length - X402_SETTLEMENT_CACHE_LIMIT;
-    if (overflow <= 0) {
-      return;
-    }
-    // Evict by completion time (earliest retry-window end first), not by Map
-    // insertion order, so an intent that was inserted early but completed late
-    // keeps its full retry window.
-    completed.sort((a, b) => a.expiresAt - b.expiresAt);
-    for (let i = 0; i < overflow; i++) {
-      this.paymentSettlements.delete(completed[i].key);
-    }
+    return unconfirmed;
   }
 
   /**
@@ -407,23 +409,38 @@ export class X402Client {
     entry.expiresAt = Date.now() + X402_SETTLEMENT_RETRY_WINDOW_MS;
     entry.nextReconfirmAt = undefined;
     entry.reconfirmFailures = undefined;
+    entry.log = undefined;
     if (entry.reservationId) {
       this.budget.settle(entry.reservationId);
     }
   }
 
   /**
-   * Record a delayed revert. The reservation is released here, exactly once,
-   * and the entry becomes a tombstone so the next observation of this intent
-   * throws X402SettlementRevertedError instead of paying fresh.
+   * Record a delayed revert. The reservation is released here, exactly once;
+   * the success observation the original caller recorded is corrected with a
+   * `success: false` entry (log + onPaymentComplete); and the entry becomes a
+   * tombstone, retained until the next observation of this intent throws
+   * X402SettlementRevertedError instead of paying fresh.
    */
   private markSettlementReverted(entry: CachedSettlement): void {
     entry.status = 'reverted';
-    entry.expiresAt = Date.now() + X402_SETTLEMENT_RETRY_WINDOW_MS;
+    entry.expiresAt = null;
     entry.nextReconfirmAt = undefined;
     if (entry.reservationId) {
       this.budget.release(entry.reservationId);
       entry.reservationId = undefined;
+    }
+    if (entry.log) {
+      const correction: X402TransactionLog = {
+        ...entry.log,
+        timestamp: Math.floor(Date.now() / 1000),
+        success: false,
+        error: `x402 settlement transaction reverted (${entry.log.txHash})`,
+        replayed: false,
+      };
+      entry.log = undefined;
+      this.budget.recordPayment(correction, { reserved: true });
+      this.config.onPaymentComplete?.(correction);
     }
   }
 
@@ -443,7 +460,7 @@ export class X402Client {
   private async executeUnkeyedPayment(
     execute: () => Promise<{ txHash: Hash }>,
     authorize: AuthorizeFreshTransfer,
-  ): Promise<{ txHash: Hash; replayed: false } | null> {
+  ): Promise<{ txHash: Hash; replayed: false; entry?: undefined } | null> {
     const reservationId = await authorize();
     if (reservationId === null) {
       return null;
@@ -463,8 +480,8 @@ export class X402Client {
     termsFingerprint: string,
     execute: () => Promise<{ txHash: Hash }>,
     authorize: AuthorizeFreshTransfer,
-  ): Promise<{ txHash: Hash; replayed: boolean } | null> {
-    this.pruneSettlements();
+  ): Promise<{ txHash: Hash; replayed: boolean; entry: CachedSettlement } | null> {
+    const unconfirmed = this.pruneSettlements();
     const existing = this.paymentSettlements.get(key);
     if (existing) {
       if (existing.termsFingerprint !== termsFingerprint) {
@@ -484,7 +501,14 @@ export class X402Client {
         // never start a second fee+payee transfer on the caller's behalf.
         this.throwObservedRevert(key, existing, observed.txHash);
       }
-      return observed;
+      return { ...observed, entry: existing };
+    }
+
+    // Fail closed while receipts cannot be observed: unconfirmed hashes are
+    // never evicted, so at this ceiling the safe move is to stop broadcasting
+    // new transfers rather than to grow state without bound.
+    if (unconfirmed >= X402_MAX_UNCONFIRMED_SETTLEMENTS) {
+      throw new X402SettlementBacklogError(unconfirmed);
     }
 
     // Reserve the in-flight slot before any await so concurrent retries share
@@ -539,7 +563,8 @@ export class X402Client {
     })();
     entry.promise = pending;
     this.paymentSettlements.set(key, entry);
-    return this.observeSettledPayment(pending, false);
+    const observed = await this.observeSettledPayment(pending, false);
+    return observed ? { ...observed, entry } : null;
   }
 
   /**
@@ -820,6 +845,15 @@ export class X402SettlementRevertedError extends Error {
   constructor(public readonly txHash: Hash) {
     super(`x402 settlement transaction reverted (${txHash})`);
     this.name = 'X402SettlementRevertedError';
+  }
+}
+
+export class X402SettlementBacklogError extends Error {
+  constructor(public readonly unconfirmedCount: number) {
+    super(
+      `x402 settlement receipts are unavailable: ${unconfirmedCount} unconfirmed settlements are retained; refusing a new transfer until confirmations resume`,
+    );
+    this.name = 'X402SettlementBacklogError';
   }
 }
 
