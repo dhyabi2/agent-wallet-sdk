@@ -1368,6 +1368,37 @@ describe('X402Client retry idempotency', () => {
     expect(executeSpy).toHaveBeenCalledTimes(X402_MAX_UNCONFIRMED_SETTLEMENTS);
   });
 
+  it('counts in-flight settlements against the unconfirmed backlog ceiling', async () => {
+    const waitReceipt = vi.fn(() => new Promise<{ status: string }>(() => {}));
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    mock402PerIntent();
+    const client = new X402Client(wallet);
+
+    for (let i = 0; i < X402_MAX_UNCONFIRMED_SETTLEMENTS; i++) {
+      void client.fetch(`${url}?n=intent-${i}`, { method: 'POST' });
+    }
+    await vi.waitFor(
+      () => {
+        expect(executeSpy).toHaveBeenCalledTimes(X402_MAX_UNCONFIRMED_SETTLEMENTS);
+      },
+      { timeout: 10_000 },
+    );
+
+    await expect(
+      client.fetch(`${url}?n=intent-overflow`, { method: 'POST' }),
+    ).rejects.toBeInstanceOf(X402SettlementBacklogError);
+    expect(executeSpy).toHaveBeenCalledTimes(X402_MAX_UNCONFIRMED_SETTLEMENTS);
+
+    // A retry of an already-submitted in-flight intent still shares the slot.
+    void client.fetch(`${url}?n=intent-0`, { method: 'POST' });
+    await Promise.resolve();
+    expect(executeSpy).toHaveBeenCalledTimes(X402_MAX_UNCONFIRMED_SETTLEMENTS);
+  });
+
   it('exports the settlement error classes from both public barrels', async () => {
     const x402Barrel = await import('../index.js');
     const rootBarrel = await import('../../index.js');

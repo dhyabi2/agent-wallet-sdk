@@ -35,10 +35,12 @@ const MAX_PAYMENT_REQUIRED_HEADER_BYTES = 64 * 1024;
  */
 export const X402_SETTLEMENT_RETRY_WINDOW_MS = 120_000;
 /**
- * Fail-closed ceiling on settlements whose receipt could not be observed.
- * Unconfirmed hashes are never evicted (that is the double-pay hazard); once
- * this many are outstanding the client refuses to broadcast new explicit-intent
- * transfers until confirmations resume.
+ * Fail-closed ceiling on settlements whose receipt is not yet final.
+ * In-flight (submitted, receipt pending) and unknown (receipt polling failed)
+ * entries both occupy this cap and are never evicted. Once this many are
+ * outstanding the client refuses to broadcast new explicit-intent transfers
+ * until confirmations resume. Retries of already-submitted intents are still
+ * served.
  */
 export const X402_MAX_UNCONFIRMED_SETTLEMENTS = 1024;
 /** First delay before an `unknown` settlement is reconfirmed opportunistically again. */
@@ -364,18 +366,27 @@ export class X402Client {
       .slice(2, 10)}`;
   }
 
+  /** In-flight and unknown entries occupy the fail-closed backlog cap. */
+  private unconfirmedSettlementCount(): number {
+    let unconfirmed = 0;
+    for (const entry of this.paymentSettlements.values()) {
+      if (entry.status === 'in-flight' || entry.status === 'unknown') {
+        unconfirmed += 1;
+      }
+    }
+    return unconfirmed;
+  }
+
   /**
    * Drop confirmed settlements whose replay window has ended and reconfirm
    * unknown ones. Nothing else is ever evicted: a confirmed entry lives for its
    * full advertised window, an unknown hash is retained until its receipt is
    * observed, and a revert tombstone is retained until a caller observes it.
-   * Returns the number of unconfirmed settlements currently retained.
+   * Returns the number of in-flight plus unknown settlements currently retained.
    */
   private pruneSettlements(now = Date.now()): number {
-    let unconfirmed = 0;
     for (const [key, entry] of this.paymentSettlements) {
       if (entry.status === 'unknown') {
-        unconfirmed += 1;
         // Never evicted: dropping an unconfirmed hash is exactly the double-pay
         // hazard. Use this client activity to keep confirming it instead of
         // waiting for the same intent to be retried.
@@ -386,7 +397,7 @@ export class X402Client {
         this.paymentSettlements.delete(key);
       }
     }
-    return unconfirmed;
+    return this.unconfirmedSettlementCount();
   }
 
   /**
@@ -481,7 +492,7 @@ export class X402Client {
     execute: () => Promise<{ txHash: Hash }>,
     authorize: AuthorizeFreshTransfer,
   ): Promise<{ txHash: Hash; replayed: boolean; entry: CachedSettlement } | null> {
-    const unconfirmed = this.pruneSettlements();
+    this.pruneSettlements();
     const existing = this.paymentSettlements.get(key);
     if (existing) {
       if (existing.termsFingerprint !== termsFingerprint) {
@@ -504,11 +515,13 @@ export class X402Client {
       return { ...observed, entry: existing };
     }
 
-    // Fail closed while receipts cannot be observed: unconfirmed hashes are
-    // never evicted, so at this ceiling the safe move is to stop broadcasting
-    // new transfers rather than to grow state without bound.
-    if (unconfirmed >= X402_MAX_UNCONFIRMED_SETTLEMENTS) {
-      throw new X402SettlementBacklogError(unconfirmed);
+    // Fail closed while receipts cannot be observed. Count in-flight and
+    // unknown entries at the reservation point (after the existing-intent
+    // lookup, before inserting a new slot) so concurrent first-time intents
+    // cannot all pass a stale unknown-only total and then broadcast.
+    const occupied = this.unconfirmedSettlementCount();
+    if (occupied >= X402_MAX_UNCONFIRMED_SETTLEMENTS) {
+      throw new X402SettlementBacklogError(occupied);
     }
 
     // Reserve the in-flight slot before any await so concurrent retries share
