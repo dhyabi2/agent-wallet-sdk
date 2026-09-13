@@ -1399,6 +1399,89 @@ describe('X402Client retry idempotency', () => {
     expect(executeSpy).toHaveBeenCalledTimes(X402_MAX_UNCONFIRMED_SETTLEMENTS);
   });
 
+  it('keeps a confirmed settlement replayable for the challenge timeout when it exceeds the default window', async () => {
+    vi.useFakeTimers();
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      if (headers.get('X-PAYMENT')) {
+        return new Response('paid', { status: 200 });
+      }
+      const longWindow = paymentRequired();
+      longWindow.accepts[0].maxTimeoutSeconds = 300;
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(longWindow)) },
+      });
+    });
+    const client = new X402Client(mockWallet);
+
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    vi.advanceTimersByTime(X402_SETTLEMENT_RETRY_WINDOW_MS + 60_000);
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.getTransactionLog().filter((log) => log.replayed)).toHaveLength(1);
+
+    vi.advanceTimersByTime(300_000);
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('counts unobserved revert tombstones against the unconfirmed ceiling', async () => {
+    const txOther = ('0x' + 'bb'.repeat(32)) as `0x${string}`;
+    const revertedHashes = new Set<string>();
+    const waitReceipt = vi.fn(async ({ hash }: { hash: string }) => {
+      if (hash === txOther) {
+        return { status: 'success' };
+      }
+      const attempts = waitReceipt.mock.calls.filter((call) => call[0].hash === hash).length;
+      if (attempts === 1) {
+        throw new Error('RPC timeout');
+      }
+      revertedHashes.add(hash);
+      return { status: 'reverted' };
+    });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockImplementation(async (...args: unknown[]) => {
+        const selected = args[0] as { extra?: { nonce?: string } } | undefined;
+        const nonce = String(selected?.extra?.nonce ?? '');
+        return { txHash: nonce.startsWith('bad-') ? (`0x${nonce.slice(4).padStart(64, '0')}` as `0x${string}`) : txOther };
+      });
+    mock402PerIntent();
+    const client = new X402Client(wallet);
+
+    // Fill the ceiling with intents whose receipts first time out, then revert
+    // in the background (never observed by their callers).
+    for (let i = 0; i < X402_MAX_UNCONFIRMED_SETTLEMENTS; i++) {
+      expect((await client.fetch(`${url}?n=bad-${i}`, { method: 'POST' })).status).toBe(200);
+    }
+    // At the ceiling (the last entry is still `unknown` until more activity
+    // reconfirms it); this refused attempt is the activity that does so.
+    await expect(client.fetch(`${url}?n=fresh`, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementBacklogError,
+    );
+    await vi.waitFor(() => {
+      expect(revertedHashes.size).toBe(X402_MAX_UNCONFIRMED_SETTLEMENTS);
+    });
+    expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
+
+    // Every one is now an unobserved tombstone: the ceiling still holds.
+    await expect(client.fetch(`${url}?n=fresh`, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementBacklogError,
+    );
+    expect(executeSpy).toHaveBeenCalledTimes(X402_MAX_UNCONFIRMED_SETTLEMENTS);
+
+    // Observing one tombstone frees one slot.
+    await expect(client.fetch(`${url}?n=bad-0`, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementRevertedError,
+    );
+    expect((await client.fetch(`${url}?n=fresh`, { method: 'POST' })).status).toBe(200);
+  });
+
   it('exports the settlement error classes from both public barrels', async () => {
     const x402Barrel = await import('../index.js');
     const rootBarrel = await import('../../index.js');

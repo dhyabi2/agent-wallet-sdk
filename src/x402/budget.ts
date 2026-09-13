@@ -3,15 +3,17 @@
 import type { X402ServiceBudget, X402TransactionLog, X402ClientConfig } from './types.js';
 
 /**
- * A broadcast payment counted against daily limits before its receipt is final.
+ * A payment counted against daily limits before its receipt is final.
  * Reservations are keyed by payment identity, not by service+amount, so a
- * release or settlement can only ever touch the spend it reserved, and a
- * reservation from a previous budget day can never subtract from the new day.
+ * release or settlement can only ever touch the spend it reserved. A
+ * reservation still pending at the daily rollover is carried into the new day
+ * (and counted against it), so it can neither land unaccounted nor subtract
+ * spend that was never added.
  */
 type X402BudgetReservation = {
   service: string;
   amount: bigint;
-  /** startOfDay() epoch seconds when the reservation was taken. */
+  /** startOfDay() epoch seconds of the budget day this reservation is counted in. */
   day: number;
 };
 
@@ -121,9 +123,10 @@ export class X402BudgetTracker {
   /**
    * Reverse a reservation when the payment definitively fails (execution threw
    * before broadcast, policy declined, or the transaction reverted on-chain).
-   * Idempotent, and scoped to the budget day the reservation was taken in: a
-   * reservation cleared by the daily reset can never subtract from the new
-   * day's totals, and a second observer of the same revert releases nothing.
+   * Idempotent, and scoped to the budget day the reservation is counted in
+   * (carried forward at rollover), so it only ever subtracts spend that was
+   * added to the current day, and a second observer of the same revert
+   * releases nothing.
    */
   release(reservationId: string): boolean {
     this.maybeResetDaily();
@@ -218,11 +221,21 @@ export class X402BudgetTracker {
     const now = this.startOfDay();
     if (now > this.dailyResetTimestamp) {
       this.dailySpend.clear();
-      // Reservations belong to the day they were taken in. Dropping them here
-      // makes any later settle/release for them a no-op against the new day.
-      this.reservations.clear();
       this.globalDailySpend = 0n;
       this.dailyResetTimestamp = now;
+      // A payment that was authorized before the rollover but has not settled
+      // yet is still going to move funds today. Carry its reservation into the
+      // new day (counting it against today's limits too) rather than letting it
+      // land unaccounted; a later release then subtracts from today's totals,
+      // which is exactly where it was re-added.
+      for (const reservation of this.reservations.values()) {
+        reservation.day = now;
+        this.dailySpend.set(
+          reservation.service,
+          (this.dailySpend.get(reservation.service) ?? 0n) + reservation.amount,
+        );
+        this.globalDailySpend += reservation.amount;
+      }
     }
   }
 

@@ -28,19 +28,20 @@ import { resolveAssetAddress } from './multi-asset.js';
 const MAX_PAYMENT_REQUIRED_HEADER_BYTES = 64 * 1024;
 
 /**
- * Window during which a successful settlement may be replayed for the same
- * intent. Every completed settlement is retained for the full window — the
- * cache is bounded by throughput × window, never by a count that could evict
- * an intent whose advertised retry window has not ended.
+ * Minimum window during which a successful settlement may be replayed for the
+ * same intent. A settlement is retained for the longer of this and the
+ * challenge's own `maxTimeoutSeconds`, so a retry inside the server's
+ * advertised window can never miss the cache. The cache is bounded by
+ * throughput × window, never by a count that could evict an unexpired intent.
  */
 export const X402_SETTLEMENT_RETRY_WINDOW_MS = 120_000;
 /**
- * Fail-closed ceiling on settlements whose receipt is not yet final.
- * In-flight (submitted, receipt pending) and unknown (receipt polling failed)
- * entries both occupy this cap and are never evicted. Once this many are
- * outstanding the client refuses to broadcast new explicit-intent transfers
- * until confirmations resume. Retries of already-submitted intents are still
- * served.
+ * Fail-closed ceiling on settlements that are not confirmed successful:
+ * in-flight (submitted, receipt pending), unknown (receipt polling failed) and
+ * reverted-but-unobserved tombstones all occupy this cap, and none of them is
+ * ever evicted. Once this many are outstanding the client refuses to broadcast
+ * new explicit-intent transfers until confirmations resume or the tombstoned
+ * intents are observed. Retries of already-submitted intents are still served.
  */
 export const X402_MAX_UNCONFIRMED_SETTLEMENTS = 1024;
 /** First delay before an `unknown` settlement is reconfirmed opportunistically again. */
@@ -54,6 +55,8 @@ type CachedSettlement = {
   promise: Promise<{ txHash: Hash }>;
   /** Canonical payment terms bound to this explicit intent. */
   termsFingerprint: string;
+  /** How long a confirmed settlement is replayable: max(default window, challenge timeout). */
+  retryWindowMs: number;
   /**
    * null until the receipt is confirmed successful; otherwise epoch ms when
    * the replay window ends. `unknown` and `reverted` entries never expire.
@@ -291,6 +294,7 @@ export class X402Client {
           buildX402PaymentTermsFingerprint(selected),
           () => this.executePayment(selected),
           authorizeFreshTransfer,
+          Math.max(X402_SETTLEMENT_RETRY_WINDOW_MS, selected.maxTimeoutSeconds * 1000),
         )
       : await this.executeUnkeyedPayment(
           () => this.executePayment(selected),
@@ -366,11 +370,14 @@ export class X402Client {
       .slice(2, 10)}`;
   }
 
-  /** In-flight and unknown entries occupy the fail-closed backlog cap. */
+  /**
+   * Everything that is not a confirmed success occupies the fail-closed
+   * backlog cap: in-flight, unknown, and unobserved revert tombstones.
+   */
   private unconfirmedSettlementCount(): number {
     let unconfirmed = 0;
     for (const entry of this.paymentSettlements.values()) {
-      if (entry.status === 'in-flight' || entry.status === 'unknown') {
+      if (entry.status !== 'confirmed') {
         unconfirmed += 1;
       }
     }
@@ -417,7 +424,7 @@ export class X402Client {
 
   private markSettlementConfirmed(entry: CachedSettlement): void {
     entry.status = 'confirmed';
-    entry.expiresAt = Date.now() + X402_SETTLEMENT_RETRY_WINDOW_MS;
+    entry.expiresAt = Date.now() + entry.retryWindowMs;
     entry.nextReconfirmAt = undefined;
     entry.reconfirmFailures = undefined;
     entry.log = undefined;
@@ -491,6 +498,7 @@ export class X402Client {
     termsFingerprint: string,
     execute: () => Promise<{ txHash: Hash }>,
     authorize: AuthorizeFreshTransfer,
+    retryWindowMs: number = X402_SETTLEMENT_RETRY_WINDOW_MS,
   ): Promise<{ txHash: Hash; replayed: boolean; entry: CachedSettlement } | null> {
     this.pruneSettlements();
     const existing = this.paymentSettlements.get(key);
@@ -515,10 +523,11 @@ export class X402Client {
       return { ...observed, entry: existing };
     }
 
-    // Fail closed while receipts cannot be observed. Count in-flight and
-    // unknown entries at the reservation point (after the existing-intent
-    // lookup, before inserting a new slot) so concurrent first-time intents
-    // cannot all pass a stale unknown-only total and then broadcast.
+    // Fail closed while receipts cannot be observed. Count every entry that is
+    // not a confirmed success (in-flight, unknown, unobserved tombstones) at
+    // the reservation point (after the existing-intent lookup, before
+    // inserting a new slot) so concurrent first-time intents cannot all pass a
+    // stale total and then broadcast, and so protected state stays bounded.
     const occupied = this.unconfirmedSettlementCount();
     if (occupied >= X402_MAX_UNCONFIRMED_SETTLEMENTS) {
       throw new X402SettlementBacklogError(occupied);
@@ -530,6 +539,7 @@ export class X402Client {
     // `promise` is assigned right after the closure below is created.
     const entry = {
       termsFingerprint,
+      retryWindowMs,
       expiresAt: null,
       status: 'in-flight',
     } as CachedSettlement;
@@ -864,7 +874,7 @@ export class X402SettlementRevertedError extends Error {
 export class X402SettlementBacklogError extends Error {
   constructor(public readonly unconfirmedCount: number) {
     super(
-      `x402 settlement receipts are unavailable: ${unconfirmedCount} unconfirmed settlements are retained; refusing a new transfer until confirmations resume`,
+      `x402 settlement backlog: ${unconfirmedCount} settlements are not confirmed successful (in flight, receipt unknown, or reverted and not yet observed); refusing a new transfer until confirmations resume`,
     );
     this.name = 'X402SettlementBacklogError';
   }

@@ -190,21 +190,51 @@ describe('X402BudgetTracker', () => {
     expect(tracker.getDailySpendSummary().global).toBe(5_000_000n);
   });
 
-  it('never subtracts a previous budget day\'s reservation from the new day', () => {
+  it('carries a still-pending reservation into the new budget day', () => {
     const realNow = Date.now;
     try {
       const dayStart = Math.floor(realNow() / 86_400_000) * 86_400_000;
       Date.now = () => dayStart + 60_000;
-      const staleTracker = new X402BudgetTracker({ globalDailyLimit: 100_000_000n });
-      const reservationId = staleTracker.reserve('api.example.com', 4_000_000n);
+      const tracker2 = new X402BudgetTracker({ globalDailyLimit: 5_000_000n });
+      const pending = tracker2.reserve('api.example.com', 4_000_000n);
+      const settledYesterday = tracker2.reserve('api.example.com', 1_000_000n);
+      tracker2.settle(settledYesterday);
+
+      // Rollover: the settled spend is gone, the pending payment still counts.
+      Date.now = () => dayStart + 86_400_000 + 60_000;
+      expect(tracker2.getDailySpendSummary().global).toBe(4_000_000n);
+      expect(tracker2.getDailySpendSummary().byService['api.example.com']).toBe(4_000_000n);
+      expect(tracker2.checkBudget('api.example.com', 2_000_000n).allowed).toBe(false);
+      expect(tracker2.checkBudget('api.example.com', 1_000_000n).allowed).toBe(true);
+
+      // It settles into today's totals without being added twice ...
+      tracker2.recordPayment(reservedLog(4_000_000n), { reserved: true });
+      expect(tracker2.settle(pending)).toBe(true);
+      expect(tracker2.getDailySpendSummary().global).toBe(4_000_000n);
+      expect(tracker2.getReservedSummary().global).toBe(0n);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  it('releases a carried-forward reservation from the new day only, and only once', () => {
+    const realNow = Date.now;
+    try {
+      const dayStart = Math.floor(realNow() / 86_400_000) * 86_400_000;
+      Date.now = () => dayStart + 60_000;
+      const tracker2 = new X402BudgetTracker({ globalDailyLimit: 100_000_000n });
+      const pending = tracker2.reserve('api.example.com', 4_000_000n);
 
       Date.now = () => dayStart + 86_400_000 + 60_000;
-      staleTracker.recordPayment(reservedLog(2_000_000n, 'other.example.com'));
-      expect(staleTracker.getDailySpendSummary().global).toBe(2_000_000n);
+      tracker2.recordPayment(reservedLog(2_000_000n, 'other.example.com'));
+      expect(tracker2.getDailySpendSummary().global).toBe(6_000_000n);
 
-      expect(staleTracker.release(reservationId)).toBe(false);
-      expect(staleTracker.getDailySpendSummary().global).toBe(2_000_000n);
-      expect(staleTracker.getDailySpendSummary().byService['other.example.com']).toBe(2_000_000n);
+      // The revert lands today: it subtracts exactly what rollover re-added.
+      expect(tracker2.release(pending)).toBe(true);
+      expect(tracker2.release(pending)).toBe(false);
+      expect(tracker2.getDailySpendSummary().global).toBe(2_000_000n);
+      expect(tracker2.getDailySpendSummary().byService['api.example.com']).toBe(0n);
+      expect(tracker2.getDailySpendSummary().byService['other.example.com']).toBe(2_000_000n);
     } finally {
       Date.now = realNow;
     }
