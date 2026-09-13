@@ -1,5 +1,12 @@
 // [MAX-ADDED] x402 Protocol Module — HTTP 402 payment support for AgentWallet
-export { X402Client, X402PaymentError, X402BudgetExceededError } from './client.js';
+export {
+  X402Client,
+  X402PaymentError,
+  X402BudgetExceededError,
+  X402SettlementRevertedError,
+  X402SettlementBacklogError,
+  X402IntentTermsConflictError,
+} from './client.js';
 export { X402BudgetTracker } from './budget.js';
 export { createX402Client, createX402Fetch, wrapWithX402 } from './middleware.js';
 export type {
