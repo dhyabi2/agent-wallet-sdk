@@ -59,6 +59,8 @@ const X402_PROTOCOL_FEE_COLLECTOR: Address =
 type CachedFeePhase = {
   txHash: Hash;
   termsFingerprint: string;
+  /** unknown: broadcast, receipt not observed; confirmed: receipt success. */
+  status: 'unknown' | 'confirmed';
 };
 
 type CachedSettlement = {
@@ -216,7 +218,7 @@ export class X402Client {
   private budget: X402BudgetTracker;
   private supportedNetworks: Set<string>;
   private paymentSettlements = new Map<string, CachedSettlement>();
-  /** Confirmed protocol-fee hashes keyed by explicit intent; survives payee-revert eviction. */
+  /** Protocol-fee hashes keyed by explicit intent; survives payee-revert eviction. */
   private feePhases = new Map<string, CachedFeePhase>();
   private unkeyedIntentSequence = 0;
 
@@ -414,6 +416,7 @@ export class X402Client {
       }
       if (entry.status === 'confirmed' && entry.expiresAt !== null && entry.expiresAt <= now) {
         this.paymentSettlements.delete(key);
+        this.feePhases.delete(key);
       }
     }
     return this.unconfirmedSettlementCount();
@@ -818,6 +821,61 @@ export class X402Client {
   }
 
   /**
+   * Confirm a broadcast protocol-fee hash. A revert forgets the phase so the
+   * next caller-initiated retry can transfer again. A transient receipt error
+   * keeps the unknown hash so retry reconfirms instead of paying 0.77% twice.
+   */
+  private async confirmProtocolFeePhase(entry: CachedFeePhase, key: string): Promise<void> {
+    try {
+      await this.waitForSettlementReceipt(entry.txHash);
+      entry.status = 'confirmed';
+    } catch (error) {
+      if (error instanceof X402SettlementRevertedError) {
+        this.feePhases.delete(key);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Transfer the protocol fee once per explicit intent. Record the hash before
+   * waiting for the receipt so a timeout cannot drop a live fee submission.
+   */
+  private async settleProtocolFeePhase(
+    intent: { key: string; termsFingerprint: string },
+    token: Address,
+    feeAmount: bigint,
+  ): Promise<void> {
+    const recordedFee = this.feePhases.get(intent.key);
+    if (recordedFee && recordedFee.termsFingerprint !== intent.termsFingerprint) {
+      throw new X402IntentTermsConflictError(
+        intent.key,
+        recordedFee.termsFingerprint,
+        intent.termsFingerprint,
+      );
+    }
+    if (recordedFee?.status === 'confirmed') {
+      return;
+    }
+    if (recordedFee?.status === 'unknown') {
+      await this.confirmProtocolFeePhase(recordedFee, intent.key);
+      return;
+    }
+    const feeTxHash = await agentTransferToken(this.wallet, {
+      token,
+      to: X402_PROTOCOL_FEE_COLLECTOR,
+      amount: feeAmount,
+    });
+    const pending: CachedFeePhase = {
+      txHash: feeTxHash,
+      termsFingerprint: intent.termsFingerprint,
+      status: 'unknown',
+    };
+    this.feePhases.set(intent.key, pending);
+    await this.confirmProtocolFeePhase(pending, intent.key);
+  }
+
+  /**
    * Execute the payment via AgentWallet's agentTransferToken.
    *
    * v6 change: resolves asset address via TokenRegistry before executing.
@@ -857,29 +915,15 @@ export class X402Client {
     const feeAmount = (amount * X402_PROTOCOL_FEE_BPS) / 10000n;
 
     if (feeAmount > 0n) {
-      const recordedFee = intent ? this.feePhases.get(intent.key) : undefined;
-      if (recordedFee && recordedFee.termsFingerprint !== intent!.termsFingerprint) {
-        throw new X402IntentTermsConflictError(
-          intent!.key,
-          recordedFee.termsFingerprint,
-          intent!.termsFingerprint,
-        );
-      }
-      if (!recordedFee) {
+      if (intent) {
+        await this.settleProtocolFeePhase(intent, resolvedAddress, feeAmount);
+      } else {
         const feeTxHash = await agentTransferToken(this.wallet, {
           token: resolvedAddress,
           to: X402_PROTOCOL_FEE_COLLECTOR,
           amount: feeAmount,
         });
-        // Fail closed: do not start the payee transfer until the fee receipt
-        // is confirmed, and do not skip a later fee unless this one landed.
         await this.waitForSettlementReceipt(feeTxHash);
-        if (intent) {
-          this.feePhases.set(intent.key, {
-            txHash: feeTxHash,
-            termsFingerprint: intent.termsFingerprint,
-          });
-        }
       }
     }
 

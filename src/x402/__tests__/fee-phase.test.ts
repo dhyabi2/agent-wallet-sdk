@@ -168,4 +168,56 @@ describe('X402Client protocol-fee phase (#50)', () => {
     expect(logs[1].replayed).toBe(true);
     expect(client.getDailySpendSummary().global).toBe(1000000n);
   });
+
+  it('retains an unknown fee submission and reconfirms it instead of transferring again', async () => {
+    const { wallet, feeHashes } = setupTransfers({
+      feeReceipts: ['success'],
+      payeeReceipts: ['success'],
+    });
+    let feeReceiptAttempts = 0;
+    const originalWait = wallet.publicClient.waitForTransactionReceipt;
+    wallet.publicClient.waitForTransactionReceipt = async (
+      args: { hash: string },
+    ) => {
+      if (args.hash === feeHashes[0]) {
+        feeReceiptAttempts += 1;
+        if (feeReceiptAttempts === 1) {
+          throw new Error('rpc timeout');
+        }
+      }
+      return originalWait(args);
+    };
+    const client = new X402Client(wallet as any);
+
+    await expect(client.fetch(URL, { method: 'POST' })).rejects.toThrow('rpc timeout');
+    expect(transfer.mock.calls).toHaveLength(1);
+    expect(isFeeTransfer(transfer.mock.calls[0][1])).toBe(true);
+
+    const retry = await client.fetch(URL, { method: 'POST' });
+    expect(retry.status).toBe(200);
+    expect(transfer.mock.calls).toHaveLength(2);
+    expect(isFeeTransfer(transfer.mock.calls[1][1])).toBe(false);
+    expect(feeReceiptAttempts).toBe(2);
+    expect(client.getTransactionLog()).toHaveLength(1);
+  });
+
+  it('expires a confirmed fee phase with its completed settlement', async () => {
+    const { wallet } = setupTransfers({
+      feeReceipts: ['success', 'success'],
+      payeeReceipts: ['success', 'success'],
+    });
+    const client = new X402Client(wallet as any);
+
+    expect((await client.fetch(URL, { method: 'POST' })).status).toBe(200);
+    expect((client as any).feePhases.size).toBe(1);
+    expect((await client.fetch(URL, { method: 'POST' })).status).toBe(200);
+    expect(transfer.mock.calls).toHaveLength(2);
+
+    (client as any).pruneSettlements(Date.now() + 200_000);
+    expect((client as any).feePhases.size).toBe(0);
+
+    expect((await client.fetch(URL, { method: 'POST' })).status).toBe(200);
+    expect(transfer.mock.calls.filter((call) => isFeeTransfer(call[1]))).toHaveLength(2);
+    expect(transfer.mock.calls).toHaveLength(4);
+  });
 });
