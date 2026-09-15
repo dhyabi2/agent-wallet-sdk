@@ -67,7 +67,7 @@ export const X402_RECONFIRM_BACKOFF_MS = 5_000;
 /** Cap on the opportunistic reconfirmation delay. */
 export const X402_RECONFIRM_BACKOFF_MAX_MS = 300_000;
 
-type SettlementConfirmation = 'confirmed' | 'unknown' | 'reverted';
+type SettlementConfirmation = 'confirmed' | 'unknown' | 'reverted' | 'queued';
 
 /** 0.77% protocol fee charged beside the payee transfer. */
 const X402_PROTOCOL_FEE_BPS = 77n;
@@ -89,19 +89,21 @@ type CachedSettlement = {
   retryWindowMs: number;
   /**
    * null until the receipt is confirmed successful; otherwise epoch ms when
-   * the replay window ends. `unknown` and `reverted` entries never expire.
+   * the replay window ends. `unknown`, `queued`, and `reverted` entries never expire.
    */
   expiresAt: number | null;
   /**
    * in-flight: policy/broadcast/first receipt still pending.
    * unknown: broadcast, but receipt polling failed; retained (never evicted) and
    *          reconfirmed on later client activity so a revert can be released.
-   * confirmed: receipt observed with status success.
+   * queued: AgentAccount parked the spend for owner approval; reservation stays
+   *         held so a retry cannot queue a second live transfer.
+   * confirmed: receipt observed with status success and tokens moved.
    * reverted: a delayed revert was found by background reconfirmation and no
    *           caller has observed it yet; retained until the next observation
    *           of this intent, which throws instead of silently paying again.
    */
-  status: 'in-flight' | 'unknown' | 'confirmed' | 'reverted';
+  status: 'in-flight' | 'unknown' | 'queued' | 'confirmed' | 'reverted';
   /** Submitted transaction hash once execute() returned. */
   txHash?: Hash;
   /** Client-side budget reservation for this settlement; settled or released exactly once. */
@@ -121,6 +123,8 @@ type CachedSettlement = {
 
 /** Internal: onBeforePayment returned false. Waiters must observe skip, not a second transfer. */
 const X402_POLICY_SKIP = Symbol('x402-policy-skip');
+/** Single unresolved unkeyed broadcast; blocks a fresh unkeyed pay until it resolves. */
+const X402_UNKEYED_PENDING_KEY = 'unkeyed:pending';
 
 /**
  * Budget authorization for one fresh transfer. Resolves with the reservation id
@@ -489,6 +493,12 @@ export class X402Client {
     void this.confirmSubmittedSettlement(key, entry.txHash).catch(() => undefined);
   }
 
+  private markSettlementQueued(entry: CachedSettlement): void {
+    entry.status = 'queued';
+    entry.expiresAt = null;
+    entry.nextReconfirmAt = undefined;
+  }
+
   private markSettlementConfirmed(entry: CachedSettlement): void {
     entry.status = 'confirmed';
     entry.expiresAt = Date.now() + entry.retryWindowMs;
@@ -537,29 +547,88 @@ export class X402Client {
     throw new X402SettlementRevertedError(txHash);
   }
 
+  /** Queued spends stay cached and reserved; a retry must not submit a second transfer. */
+  private throwObservedQueued(txHash: Hash): never {
+    throw new X402SettlementQueuedError(txHash);
+  }
+
   /**
-   * A 402 without an explicit intent id is paid once per call. The spend is
-   * reserved before the transfer and settled as soon as the transfer is
-   * submitted; there is no replay cache to keep it pending against.
+   * A 402 without an explicit intent id is paid once per call once its receipt
+   * is a confirmed success. After a hash is broadcast, keep that hash and its
+   * reservation until the receipt resolves so a caller retry cannot submit a
+   * second unkeyed transfer.
    */
   private async executeUnkeyedPayment(
     execute: () => Promise<{ txHash: Hash }>,
     authorize: AuthorizeFreshTransfer,
   ): Promise<{ txHash: Hash; replayed: false; entry?: undefined } | null> {
+    this.pruneSettlements();
+    const existing = this.paymentSettlements.get(X402_UNKEYED_PENDING_KEY);
+    if (existing?.txHash) {
+      if (existing.status === 'queued') {
+        this.throwObservedQueued(existing.txHash);
+      }
+      if (existing.status === 'unknown') {
+        const confirmation = await this.confirmSubmittedSettlement(
+          X402_UNKEYED_PENDING_KEY,
+          existing.txHash,
+        );
+        if (confirmation === 'confirmed') {
+          this.paymentSettlements.delete(X402_UNKEYED_PENDING_KEY);
+          return { txHash: existing.txHash, replayed: false };
+        }
+        if (confirmation === 'queued') {
+          this.throwObservedQueued(existing.txHash);
+        }
+        if (confirmation === 'reverted') {
+          this.throwObservedRevert(X402_UNKEYED_PENDING_KEY, existing, existing.txHash);
+        }
+        throw new Error(
+          `x402 unkeyed settlement receipt not yet observed (${existing.txHash})`,
+        );
+      }
+    }
+
     const reservationId = await authorize();
     if (reservationId === null) {
       return null;
     }
+    let installed = false;
     try {
       const result = await execute();
-      // Unkeyed challenges have no replay cache, so a later fetch pays again.
-      // Still wait for the receipt: a queued or reverted hash must never be
-      // sent as X-PAYMENT, and the reservation must be released if nothing moved.
-      await this.waitForSettlementReceipt(result.txHash);
-      this.budget.settle(reservationId);
+      const entry = {
+        promise: Promise.resolve(result),
+        termsFingerprint: X402_UNKEYED_PENDING_KEY,
+        retryWindowMs: X402_SETTLEMENT_RETRY_WINDOW_MS,
+        expiresAt: null,
+        status: 'in-flight',
+        txHash: result.txHash,
+        reservationId,
+      } as CachedSettlement;
+      this.paymentSettlements.set(X402_UNKEYED_PENDING_KEY, entry);
+      installed = true;
+      try {
+        await this.waitForSettlementReceipt(result.txHash);
+      } catch (receiptError) {
+        if (receiptError instanceof X402SettlementRevertedError) {
+          this.budget.release(reservationId);
+          this.paymentSettlements.delete(X402_UNKEYED_PENDING_KEY);
+          throw receiptError;
+        }
+        if (receiptError instanceof X402SettlementQueuedError) {
+          this.markSettlementQueued(entry);
+          throw receiptError;
+        }
+        entry.status = 'unknown';
+        throw receiptError;
+      }
+      this.markSettlementConfirmed(entry);
+      this.paymentSettlements.delete(X402_UNKEYED_PENDING_KEY);
       return { txHash: result.txHash, replayed: false };
     } catch (error) {
-      this.budget.release(reservationId);
+      if (!installed) {
+        this.budget.release(reservationId);
+      }
       throw error;
     }
   }
@@ -594,12 +663,18 @@ export class X402Client {
           existing.expiresAt = Math.max(existing.expiresAt, Date.now() + retryWindowMs);
         }
       }
+      if (existing.status === 'queued' && existing.txHash) {
+        this.throwObservedQueued(existing.txHash);
+      }
       const observed = await this.observeSettledPayment(existing.promise, true);
       if (!observed) {
         return null;
       }
       if (existing.status === 'unknown') {
         await this.confirmSubmittedSettlement(key, observed.txHash);
+      }
+      if (existing.status === 'queued' && existing.txHash) {
+        this.throwObservedQueued(existing.txHash);
       }
       if (existing.status === 'reverted') {
         // The original broadcast definitively failed (found either by this
@@ -652,13 +727,16 @@ export class X402Client {
         try {
           await this.waitForSettlementReceipt(result.txHash);
         } catch (receiptError) {
-          if (
-            receiptError instanceof X402SettlementRevertedError
-            || receiptError instanceof X402SettlementQueuedError
-          ) {
-            // Confirmed revert or AgentAccount queue: nothing moved to the
-            // payee, release once, evict (below). Never send the hash as proof.
+          if (receiptError instanceof X402SettlementRevertedError) {
+            // Confirmed revert: nothing moved to the payee, release once, evict
+            // (below). Never send the hash as proof.
             this.budget.release(reservationId);
+            throw receiptError;
+          }
+          if (receiptError instanceof X402SettlementQueuedError) {
+            // Live AgentAccount queue: keep the hash and reservation so a retry
+            // cannot create a second approvable transfer. Never send as proof.
+            this.markSettlementQueued(entry);
             throw receiptError;
           }
           // Broadcast already happened but the outcome is unknown (RPC
@@ -671,6 +749,9 @@ export class X402Client {
         this.pruneSettlements();
         return result;
       } catch (error) {
+        if (entry.status === 'queued' || entry.status === 'unknown') {
+          throw error;
+        }
         if (this.paymentSettlements.get(key) === entry) {
           this.paymentSettlements.delete(key);
         }
@@ -705,6 +786,9 @@ export class X402Client {
     if (entry.status === 'reverted') {
       return 'reverted';
     }
+    if (entry.status === 'queued') {
+      return 'queued';
+    }
     if (entry.confirming) {
       return entry.confirming;
     }
@@ -717,12 +801,13 @@ export class X402Client {
         }
         return 'confirmed';
       } catch (receiptError) {
-        if (
-          receiptError instanceof X402SettlementRevertedError
-          || receiptError instanceof X402SettlementQueuedError
-        ) {
+        if (receiptError instanceof X402SettlementRevertedError) {
           this.markSettlementReverted(entry);
           return 'reverted';
+        }
+        if (receiptError instanceof X402SettlementQueuedError) {
+          this.markSettlementQueued(entry);
+          return 'queued';
         }
         const failures = (entry.reconfirmFailures ?? 0) + 1;
         entry.reconfirmFailures = failures;

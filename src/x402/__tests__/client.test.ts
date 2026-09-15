@@ -800,11 +800,17 @@ describe('X402Client retry idempotency', () => {
     );
     expect(executeSpy).toHaveBeenCalledTimes(1);
     expect(client.getTransactionLog()).toHaveLength(0);
-    expect(client.getDailySpendSummary().global).toBe(0n);
-    expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
+    expect(client.getDailySpendSummary().global).toBe(1000000n);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
     expect(
       fetchSpy.mock.calls.some(([, init]) => new Headers(init?.headers).has('X-PAYMENT')),
     ).toBe(false);
+
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementQueuedError,
+    );
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
   });
 
   it('waits for receipt on unkeyed challenges and fails closed when queued', async () => {
@@ -821,7 +827,7 @@ describe('X402Client retry idempotency', () => {
       address: '0x2222222222222222222222222222222222222222',
       publicClient: { waitForTransactionReceipt: waitReceipt },
     } as any;
-    vi.spyOn(X402Client.prototype as any, 'executePayment')
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
       .mockResolvedValue({ txHash });
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
       const headers = new Headers(init?.headers);
@@ -835,13 +841,57 @@ describe('X402Client retry idempotency', () => {
         headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
       });
     });
-    const client = new X402Client(wallet);
+    const client = new X402Client(wallet, { globalDailyLimit: 1000000n });
 
     await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
       X402SettlementQueuedError,
     );
     expect(waitReceipt).toHaveBeenCalledWith({ hash: txHash });
+    expect(executeSpy).toHaveBeenCalledTimes(1);
     expect(client.getTransactionLog()).toHaveLength(0);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementQueuedError,
+    );
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+  });
+
+  it('retains an unkeyed broadcast when receipt polling fails so a retry cannot double-pay', async () => {
+    const waitReceipt = vi.fn()
+      .mockRejectedValueOnce(new Error('RPC timeout'))
+      .mockResolvedValue({ status: 'success' });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      if (headers.get('X-PAYMENT')) {
+        return new Response('paid', { status: 200 });
+      }
+      const unkeyed = paymentRequired();
+      delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+      });
+    });
+    const client = new X402Client(wallet, { globalDailyLimit: 1000000n });
+
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toThrow(/RPC timeout/);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+    expect(client.getTransactionLog()).toHaveLength(0);
+
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(waitReceipt).toHaveBeenCalledTimes(2);
+    expect(client.getTransactionLog()).toHaveLength(1);
+    expect(client.getDailySpendSummary().global).toBe(1000000n);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
   });
 
   it('drops a reverted settlement so a later retry can transfer again', async () => {
