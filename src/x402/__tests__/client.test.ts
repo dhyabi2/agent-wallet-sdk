@@ -894,6 +894,147 @@ describe('X402Client retry idempotency', () => {
     expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
   });
 
+  it('does not reuse an unkeyed hash as proof for a different resource', async () => {
+    const firstHash = txHash;
+    const secondHash = ('0x' + 'cd'.repeat(32)) as `0x${string}`;
+    const otherUrl = 'https://api.example.com/premium/other';
+    const waitReceipt = vi.fn()
+      .mockRejectedValueOnce(new Error('RPC timeout'))
+      .mockResolvedValue({ status: 'success' });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValueOnce({ txHash: firstHash })
+      .mockResolvedValueOnce({ txHash: secondHash });
+    const paymentHeaders: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const headers = new Headers(init?.headers);
+      const payment = headers.get('X-PAYMENT');
+      if (payment) {
+        paymentHeaders.push(payment);
+        return new Response('paid', { status: 200 });
+      }
+      const requested = new URL(String(input));
+      const unkeyed = {
+        x402Version: 1,
+        resource: {
+          url: requested.pathname,
+          description: 'Data API',
+          mimeType: 'application/json',
+        },
+        accepts: [
+          {
+            scheme: 'exact',
+            network: 'base:8453',
+            asset,
+            amount: '1000000',
+            payTo,
+            maxTimeoutSeconds: 30,
+          },
+        ],
+      };
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+      });
+    });
+    const client = new X402Client(wallet, { globalDailyLimit: 2000000n });
+
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toThrow(/RPC timeout/);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+
+    expect((await client.fetch(otherUrl, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+    expect(client.getTransactionLog()).toHaveLength(1);
+    expect(client.getTransactionLog()[0].url).toBe(otherUrl);
+    expect(client.getTransactionLog()[0].txHash).toBe(secondHash);
+    const retryPayload = JSON.parse(atob(paymentHeaders[0]));
+    expect(retryPayload.payload.txHash).toBe(secondHash);
+
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+    expect(client.getTransactionLog()).toHaveLength(2);
+    expect(client.getTransactionLog()[1].url).toBe(url);
+    expect(client.getTransactionLog()[1].txHash).toBe(firstHash);
+    const firstResourcePayload = JSON.parse(atob(paymentHeaders[1]));
+    expect(firstResourcePayload.payload.txHash).toBe(firstHash);
+    expect(client.getDailySpendSummary().global).toBe(2000000n);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
+  });
+
+  it('does not block an unrelated unkeyed payment after another resource queued', async () => {
+    const firstHash = txHash;
+    const secondHash = ('0x' + 'cd'.repeat(32)) as `0x${string}`;
+    const otherUrl = 'https://api.example.com/premium/other';
+    const queuedReceipt = {
+      status: 'success',
+      logs: [
+        {
+          address: '0x2222222222222222222222222222222222222222',
+          topics: [X402_TRANSACTION_QUEUED_TOPIC],
+        },
+      ],
+    };
+    const waitReceipt = vi.fn()
+      .mockResolvedValueOnce(queuedReceipt)
+      .mockResolvedValue({ status: 'success' });
+    const wallet = {
+      address: '0x2222222222222222222222222222222222222222',
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValueOnce({ txHash: firstHash })
+      .mockResolvedValueOnce({ txHash: secondHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const headers = new Headers(init?.headers);
+      if (headers.get('X-PAYMENT')) {
+        return new Response('paid', { status: 200 });
+      }
+      const requested = new URL(String(input));
+      const unkeyed = {
+        x402Version: 1,
+        resource: {
+          url: requested.pathname,
+          description: 'Data API',
+          mimeType: 'application/json',
+        },
+        accepts: [
+          {
+            scheme: 'exact',
+            network: 'base:8453',
+            asset,
+            amount: '1000000',
+            payTo,
+            maxTimeoutSeconds: 30,
+          },
+        ],
+      };
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+      });
+    });
+    const client = new X402Client(wallet, { globalDailyLimit: 2000000n });
+
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementQueuedError,
+    );
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+
+    expect((await client.fetch(otherUrl, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+    expect(client.getTransactionLog()).toHaveLength(1);
+    expect(client.getTransactionLog()[0].txHash).toBe(secondHash);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementQueuedError,
+    );
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+  });
+
   it('drops a reverted settlement so a later retry can transfer again', async () => {
     const waitReceipt = vi.fn()
       .mockResolvedValueOnce({ status: 'reverted' })

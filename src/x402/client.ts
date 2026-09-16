@@ -123,8 +123,6 @@ type CachedSettlement = {
 
 /** Internal: onBeforePayment returned false. Waiters must observe skip, not a second transfer. */
 const X402_POLICY_SKIP = Symbol('x402-policy-skip');
-/** Single unresolved unkeyed broadcast; blocks a fresh unkeyed pay until it resolves. */
-const X402_UNKEYED_PENDING_KEY = 'unkeyed:pending';
 
 /**
  * Budget authorization for one fresh transfer. Resolves with the reservation id
@@ -206,6 +204,25 @@ export function buildX402PaymentTermsFingerprint(req: X402PaymentRequirements): 
     encodeX402KeyField(canonicalizeX402Amount(req.amount)),
     encodeX402KeyField(req.payTo.toLowerCase()),
     encodeX402KeyField(req.scheme),
+  ].join('|');
+}
+
+/**
+ * Cache key for a 402 that carries no explicit intent id. Scoped to method +
+ * URL + terms so an unresolved unkeyed broadcast cannot be reused as proof
+ * for a different resource, and cannot block a later unrelated payment.
+ */
+export function buildUnkeyedPendingKey(
+  method: string,
+  url: string | URL,
+  termsFingerprint: string,
+): string {
+  const normalizedMethod = method.trim().toUpperCase() || 'GET';
+  return [
+    'unkeyed',
+    encodeX402KeyField(normalizedMethod),
+    encodeX402KeyField(canonicalizeX402RequestUrl(url)),
+    termsFingerprint,
   ].join('|');
 }
 
@@ -358,15 +375,17 @@ export class X402Client {
       return reserved.reservationId;
     };
 
+    const termsFingerprint = buildX402PaymentTermsFingerprint(selected);
     const paymentResult = explicitIntent
       ? await this.settlePayment(
           buildX402PaymentIntentKey(method, urlStr, explicitIntent),
-          buildX402PaymentTermsFingerprint(selected),
+          termsFingerprint,
           (intent) => this.executePayment(selected, intent),
           authorizeFreshTransfer,
           Math.max(X402_SETTLEMENT_RETRY_WINDOW_MS, selected.maxTimeoutSeconds * 1000),
         )
       : await this.executeUnkeyedPayment(
+          buildUnkeyedPendingKey(method, urlStr, termsFingerprint),
           () => this.executePayment(selected),
           authorizeFreshTransfer,
         );
@@ -555,33 +574,40 @@ export class X402Client {
   /**
    * A 402 without an explicit intent id is paid once per call once its receipt
    * is a confirmed success. After a hash is broadcast, keep that hash and its
-   * reservation until the receipt resolves so a caller retry cannot submit a
-   * second unkeyed transfer.
+   * reservation under this request's unkeyed key until the receipt resolves so
+   * a caller retry of the same resource cannot submit a second transfer.
    */
   private async executeUnkeyedPayment(
+    key: string,
     execute: () => Promise<{ txHash: Hash }>,
     authorize: AuthorizeFreshTransfer,
   ): Promise<{ txHash: Hash; replayed: false; entry?: undefined } | null> {
     this.pruneSettlements();
-    const existing = this.paymentSettlements.get(X402_UNKEYED_PENDING_KEY);
+    const existing = this.paymentSettlements.get(key);
     if (existing?.txHash) {
       if (existing.status === 'queued') {
         this.throwObservedQueued(existing.txHash);
       }
+      if (existing.status === 'confirmed') {
+        // Background reconfirm already observed success. Deliver that hash
+        // as proof; do not authorize a second transfer.
+        this.paymentSettlements.delete(key);
+        return { txHash: existing.txHash, replayed: false };
+      }
       if (existing.status === 'unknown') {
         const confirmation = await this.confirmSubmittedSettlement(
-          X402_UNKEYED_PENDING_KEY,
+          key,
           existing.txHash,
         );
         if (confirmation === 'confirmed') {
-          this.paymentSettlements.delete(X402_UNKEYED_PENDING_KEY);
+          this.paymentSettlements.delete(key);
           return { txHash: existing.txHash, replayed: false };
         }
         if (confirmation === 'queued') {
           this.throwObservedQueued(existing.txHash);
         }
         if (confirmation === 'reverted') {
-          this.throwObservedRevert(X402_UNKEYED_PENDING_KEY, existing, existing.txHash);
+          this.throwObservedRevert(key, existing, existing.txHash);
         }
         throw new Error(
           `x402 unkeyed settlement receipt not yet observed (${existing.txHash})`,
@@ -598,21 +624,21 @@ export class X402Client {
       const result = await execute();
       const entry = {
         promise: Promise.resolve(result),
-        termsFingerprint: X402_UNKEYED_PENDING_KEY,
+        termsFingerprint: key,
         retryWindowMs: X402_SETTLEMENT_RETRY_WINDOW_MS,
         expiresAt: null,
         status: 'in-flight',
         txHash: result.txHash,
         reservationId,
       } as CachedSettlement;
-      this.paymentSettlements.set(X402_UNKEYED_PENDING_KEY, entry);
+      this.paymentSettlements.set(key, entry);
       installed = true;
       try {
         await this.waitForSettlementReceipt(result.txHash);
       } catch (receiptError) {
         if (receiptError instanceof X402SettlementRevertedError) {
           this.budget.release(reservationId);
-          this.paymentSettlements.delete(X402_UNKEYED_PENDING_KEY);
+          this.paymentSettlements.delete(key);
           throw receiptError;
         }
         if (receiptError instanceof X402SettlementQueuedError) {
@@ -623,7 +649,7 @@ export class X402Client {
         throw receiptError;
       }
       this.markSettlementConfirmed(entry);
-      this.paymentSettlements.delete(X402_UNKEYED_PENDING_KEY);
+      this.paymentSettlements.delete(key);
       return { txHash: result.txHash, replayed: false };
     } catch (error) {
       if (!installed) {
