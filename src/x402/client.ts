@@ -217,6 +217,17 @@ type SettlementReceiptLog = {
 type SettlementReceipt = {
   status?: string;
   logs?: readonly SettlementReceiptLog[];
+  transactionHash?: Hash;
+};
+
+type SettlementReplacementReason = 'repriced' | 'cancelled' | 'replaced';
+
+type SettlementReplacementEvent = {
+  reason?: string;
+  transactionReceipt?: {
+    status?: string;
+    transactionHash?: Hash;
+  };
 };
 
 /**
@@ -607,8 +618,9 @@ export class X402Client {
       } as CachedSettlement;
       this.paymentSettlements.set(X402_UNKEYED_PENDING_KEY, entry);
       installed = true;
+      let settledHash: Hash;
       try {
-        await this.waitForSettlementReceipt(result.txHash);
+        settledHash = await this.waitForSettlementReceipt(result.txHash);
       } catch (receiptError) {
         if (receiptError instanceof X402SettlementRevertedError) {
           this.budget.release(reservationId);
@@ -622,9 +634,10 @@ export class X402Client {
         entry.status = 'unknown';
         throw receiptError;
       }
+      entry.txHash = settledHash;
       this.markSettlementConfirmed(entry);
       this.paymentSettlements.delete(X402_UNKEYED_PENDING_KEY);
-      return { txHash: result.txHash, replayed: false };
+      return { txHash: settledHash, replayed: false };
     } catch (error) {
       if (!installed) {
         this.budget.release(reservationId);
@@ -682,9 +695,13 @@ export class X402Client {
         // released exactly once when the revert was recorded. Fail closed:
         // never auto-retry a confirmed revert. A later caller-initiated
         // attempt may resume the payee transfer without re-charging the fee.
-        this.throwObservedRevert(key, existing, observed.txHash);
+        this.throwObservedRevert(key, existing, existing.txHash ?? observed.txHash);
       }
-      return { ...observed, entry: existing };
+      return {
+        txHash: existing.txHash ?? observed.txHash,
+        replayed: observed.replayed,
+        entry: existing,
+      };
     }
 
     // Fail closed while receipts cannot be observed. Count every entry that is
@@ -725,7 +742,9 @@ export class X402Client {
         }
         entry.txHash = result.txHash;
         try {
-          await this.waitForSettlementReceipt(result.txHash);
+          const settledHash = await this.waitForSettlementReceipt(result.txHash);
+          entry.txHash = settledHash;
+          result = { txHash: settledHash };
         } catch (receiptError) {
           if (receiptError instanceof X402SettlementRevertedError) {
             // Confirmed revert: nothing moved to the payee, release once, evict
@@ -794,8 +813,9 @@ export class X402Client {
     }
     const confirming = (async (): Promise<SettlementConfirmation> => {
       try {
-        await this.waitForSettlementReceipt(txHash);
+        const settledHash = await this.waitForSettlementReceipt(txHash);
         if (this.paymentSettlements.get(key) === entry) {
+          entry.txHash = settledHash;
           this.markSettlementConfirmed(entry);
           this.pruneSettlements();
         }
@@ -843,8 +863,12 @@ export class X402Client {
    * A submitted hash is not a completed settlement. Keep the cache entry
    * in-flight (expiresAt = null) until the receipt is final so a later retry
    * cannot broadcast a second fee+payee transfer.
+   *
+   * viem resolves a replaced nonce with the *replacement* receipt. A reprice
+   * still paid the payee under a new hash; a cancel or unrelated replacement
+   * did not. Adopt the new hash only for `repriced`; fail closed otherwise.
    */
-  private async waitForSettlementReceipt(txHash: Hash): Promise<void> {
+  private async waitForSettlementReceipt(txHash: Hash): Promise<Hash> {
     const publicClient = this.wallet?.publicClient;
     const wait = publicClient?.waitForTransactionReceipt;
     if (typeof wait !== 'function') {
@@ -852,7 +876,25 @@ export class X402Client {
         'x402 settlement cannot be confirmed: wallet publicClient.waitForTransactionReceipt is missing',
       );
     }
-    const receipt = await wait.call(publicClient, { hash: txHash }) as SettlementReceipt | null;
+    let replacementReason: SettlementReplacementReason | undefined;
+    let replacementHash: Hash | undefined;
+    const receipt = await wait.call(publicClient, {
+      hash: txHash,
+      onReplaced: (event: SettlementReplacementEvent) => {
+        const reason = event?.reason;
+        if (reason !== 'repriced' && reason !== 'cancelled' && reason !== 'replaced') {
+          return;
+        }
+        replacementReason = reason;
+        const nextHash = event.transactionReceipt?.transactionHash;
+        if (typeof nextHash === 'string' && nextHash.startsWith('0x')) {
+          replacementHash = nextHash;
+        }
+      },
+    }) as SettlementReceipt | null;
+    if (replacementReason === 'cancelled' || replacementReason === 'replaced') {
+      throw new X402SettlementRevertedError(txHash);
+    }
     if (receipt?.status === 'reverted') {
       throw new X402SettlementRevertedError(txHash);
     }
@@ -863,9 +905,21 @@ export class X402Client {
           : `x402 settlement receipt missing (${txHash})`,
       );
     }
-    if (x402SettlementReceiptIsQueued(receipt, this.wallet?.address)) {
-      throw new X402SettlementQueuedError(txHash);
+    const receiptHash = receipt.transactionHash;
+    const adoptedHash = replacementReason === 'repriced'
+      ? (replacementHash ?? (typeof receiptHash === 'string' ? receiptHash : txHash))
+      : txHash;
+    if (
+      replacementReason !== 'repriced'
+      && typeof receiptHash === 'string'
+      && receiptHash !== txHash
+    ) {
+      throw new X402SettlementRevertedError(txHash);
     }
+    if (x402SettlementReceiptIsQueued(receipt, this.wallet?.address)) {
+      throw new X402SettlementQueuedError(adoptedHash);
+    }
+    return adoptedHash;
   }
 
   /**
@@ -982,7 +1036,7 @@ export class X402Client {
    */
   private async confirmProtocolFeePhase(entry: CachedFeePhase, key: string): Promise<void> {
     try {
-      await this.waitForSettlementReceipt(entry.txHash);
+      entry.txHash = await this.waitForSettlementReceipt(entry.txHash);
       entry.status = 'confirmed';
     } catch (error) {
       if (error instanceof X402SettlementRevertedError) {
