@@ -1017,6 +1017,47 @@ describe('X402Client retry idempotency', () => {
     expect(client.getTransactionLog()[1].replayed).toBe(true);
   });
 
+  it('adopts a delayed reprice onto the stored observation so retries cannot report the obsolete hash', async () => {
+    const repricedHash = ('0x' + 'cd'.repeat(32)) as `0x${string}`;
+    const waitReceipt = vi.fn()
+      .mockRejectedValueOnce(new Error('RPC timeout'))
+      .mockImplementation(async ({
+        onReplaced,
+      }: {
+        hash: string;
+        onReplaced?: (event: {
+          reason: string;
+          transactionReceipt: { status: string; transactionHash: string };
+        }) => void;
+      }) => {
+        onReplaced?.({
+          reason: 'repriced',
+          transactionReceipt: { status: 'success', transactionHash: repricedHash },
+        });
+        return { status: 'success', transactionHash: repricedHash };
+      });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    mock402ThenPaid();
+    const client = new X402Client(wallet, { globalDailyLimit: 1000000n });
+
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.getTransactionLog().map((log) => log.txHash)).toEqual([txHash]);
+
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(waitReceipt).toHaveBeenCalledTimes(2);
+    expect(client.getTransactionLog().map((log) => log.txHash)).toEqual([
+      repricedHash,
+      repricedHash,
+    ]);
+    expect(client.getTransactionLog()[1].replayed).toBe(true);
+  });
+
   it('keeps the original hash when a success receipt does not rename the transaction', async () => {
     const waitReceipt = vi.fn(async () => ({
       status: 'success',

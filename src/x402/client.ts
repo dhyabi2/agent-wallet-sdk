@@ -817,6 +817,9 @@ export class X402Client {
       try {
         const settledHash = await this.waitForSettlementReceipt(txHash);
         if (this.paymentSettlements.get(key) === entry) {
+          if (entry.log) {
+            entry.log.txHash = settledHash;
+          }
           entry.txHash = settledHash;
           this.markSettlementConfirmed(entry);
           this.pruneSettlements();
