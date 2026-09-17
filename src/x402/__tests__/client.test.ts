@@ -755,7 +755,10 @@ describe('X402Client retry idempotency', () => {
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
     expect(executeSpy).toHaveBeenCalledTimes(1);
-    expect(waitReceipt).toHaveBeenCalledWith({ hash: txHash });
+    expect(waitReceipt).toHaveBeenCalledWith({
+      hash: txHash,
+      onReplaced: expect.any(Function),
+    });
     expect(client.getTransactionLog().filter((log) => log.replayed)).toHaveLength(1);
     expect(client.getDailySpendSummary().global).toBe(1000000n);
   });
@@ -846,7 +849,10 @@ describe('X402Client retry idempotency', () => {
     await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
       X402SettlementQueuedError,
     );
-    expect(waitReceipt).toHaveBeenCalledWith({ hash: txHash });
+    expect(waitReceipt).toHaveBeenCalledWith({
+      hash: txHash,
+      onReplaced: expect.any(Function),
+    });
     expect(executeSpy).toHaveBeenCalledTimes(1);
     expect(client.getTransactionLog()).toHaveLength(0);
     expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
@@ -856,6 +862,230 @@ describe('X402Client retry idempotency', () => {
     );
     expect(executeSpy).toHaveBeenCalledTimes(1);
     expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+  });
+
+  it('adopts a repriced settlement hash before sending X-PAYMENT', async () => {
+    const repricedHash = ('0x' + 'cd'.repeat(32)) as `0x${string}`;
+    const paymentHashes: string[] = [];
+    const waitReceipt = vi.fn(async ({
+      onReplaced,
+    }: {
+      hash: string;
+      onReplaced?: (event: {
+        reason: string;
+        transactionReceipt: { status: string; transactionHash: string };
+      }) => void;
+    }) => {
+      onReplaced?.({
+        reason: 'repriced',
+        transactionReceipt: { status: 'success', transactionHash: repricedHash },
+      });
+      return { status: 'success', transactionHash: repricedHash };
+    });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      const proof = headers.get('X-PAYMENT');
+      if (proof) {
+        paymentHashes.push(JSON.parse(atob(proof)).payload.txHash);
+        return new Response('paid', { status: 200 });
+      }
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(paymentRequired())) },
+      });
+    });
+    const client = new X402Client(wallet);
+
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(paymentHashes).toEqual([repricedHash, repricedHash]);
+    expect(client.getTransactionLog().map((log) => log.txHash)).toEqual([
+      repricedHash,
+      repricedHash,
+    ]);
+    expect(client.getTransactionLog()[1].replayed).toBe(true);
+  });
+
+  it('fails closed when a pending settlement is cancelled', async () => {
+    const cancelledHash = ('0x' + '11'.repeat(32)) as `0x${string}`;
+    const waitReceipt = vi.fn(async ({
+      onReplaced,
+    }: {
+      hash: string;
+      onReplaced?: (event: {
+        reason: string;
+        transactionReceipt: { status: string; transactionHash: string };
+      }) => void;
+    }) => {
+      onReplaced?.({
+        reason: 'cancelled',
+        transactionReceipt: { status: 'success', transactionHash: cancelledHash },
+      });
+      return { status: 'success', transactionHash: cancelledHash };
+    });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    const fetchSpy = mock402ThenPaid();
+    const client = new X402Client(wallet, { globalDailyLimit: 1000000n });
+
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementRevertedError,
+    );
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.getTransactionLog()).toHaveLength(0);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
+    expect(
+      fetchSpy.mock.calls.some(([, init]) => new Headers(init?.headers).has('X-PAYMENT')),
+    ).toBe(false);
+  });
+
+  it('fails closed when a pending settlement is replaced by an unrelated transaction', async () => {
+    const replacedHash = ('0x' + '22'.repeat(32)) as `0x${string}`;
+    const waitReceipt = vi.fn(async ({
+      onReplaced,
+    }: {
+      hash: string;
+      onReplaced?: (event: {
+        reason: string;
+        transactionReceipt: { status: string; transactionHash: string };
+      }) => void;
+    }) => {
+      onReplaced?.({
+        reason: 'replaced',
+        transactionReceipt: { status: 'success', transactionHash: replacedHash },
+      });
+      return { status: 'success', transactionHash: replacedHash };
+    });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    const fetchSpy = mock402ThenPaid();
+    const client = new X402Client(wallet);
+
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementRevertedError,
+    );
+    expect(
+      fetchSpy.mock.calls.some(([, init]) => new Headers(init?.headers).has('X-PAYMENT')),
+    ).toBe(false);
+    expect(client.getTransactionLog()).toHaveLength(0);
+  });
+
+  it('keeps a hash-mismatch without onReplaced as unknown so a retry cannot double-pay', async () => {
+    const otherHash = ('0x' + '33'.repeat(32)) as `0x${string}`;
+    const waitReceipt = vi.fn()
+      .mockResolvedValueOnce({
+        status: 'success',
+        transactionHash: otherHash,
+      })
+      .mockResolvedValue({
+        status: 'success',
+        transactionHash: txHash,
+      });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    mock402ThenPaid();
+    const client = new X402Client(wallet, { globalDailyLimit: 1000000n });
+
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(waitReceipt).toHaveBeenCalledTimes(2);
+    expect(client.getDailySpendSummary().global).toBe(1000000n);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
+    expect(client.getTransactionLog().map((log) => log.txHash)).toEqual([
+      txHash,
+      txHash,
+    ]);
+    expect(client.getTransactionLog()[1].replayed).toBe(true);
+  });
+
+  it('adopts a delayed reprice onto the stored observation so retries cannot report the obsolete hash', async () => {
+    const repricedHash = ('0x' + 'cd'.repeat(32)) as `0x${string}`;
+    const waitReceipt = vi.fn()
+      .mockRejectedValueOnce(new Error('RPC timeout'))
+      .mockImplementation(async ({
+        onReplaced,
+      }: {
+        hash: string;
+        onReplaced?: (event: {
+          reason: string;
+          transactionReceipt: { status: string; transactionHash: string };
+        }) => void;
+      }) => {
+        onReplaced?.({
+          reason: 'repriced',
+          transactionReceipt: { status: 'success', transactionHash: repricedHash },
+        });
+        return { status: 'success', transactionHash: repricedHash };
+      });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    mock402ThenPaid();
+    const client = new X402Client(wallet, { globalDailyLimit: 1000000n });
+
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.getTransactionLog().map((log) => log.txHash)).toEqual([txHash]);
+
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(waitReceipt).toHaveBeenCalledTimes(2);
+    expect(client.getTransactionLog().map((log) => log.txHash)).toEqual([
+      repricedHash,
+      repricedHash,
+    ]);
+    expect(client.getTransactionLog()[1].replayed).toBe(true);
+  });
+
+  it('keeps the original hash when a success receipt does not rename the transaction', async () => {
+    const waitReceipt = vi.fn(async () => ({
+      status: 'success',
+      transactionHash: txHash,
+    }));
+    const paymentHashes: string[] = [];
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      const proof = headers.get('X-PAYMENT');
+      if (proof) {
+        paymentHashes.push(JSON.parse(atob(proof)).payload.txHash);
+        return new Response('paid', { status: 200 });
+      }
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(paymentRequired())) },
+      });
+    });
+    const client = new X402Client(wallet);
+
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(paymentHashes).toEqual([txHash]);
+    expect(client.getTransactionLog()[0].txHash).toBe(txHash);
   });
 
   it('retains an unkeyed broadcast when receipt polling fails so a retry cannot double-pay', async () => {
