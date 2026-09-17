@@ -628,6 +628,7 @@ export class X402Client {
           throw receiptError;
         }
         if (receiptError instanceof X402SettlementQueuedError) {
+          entry.txHash = receiptError.txHash;
           this.markSettlementQueued(entry);
           throw receiptError;
         }
@@ -755,6 +756,7 @@ export class X402Client {
           if (receiptError instanceof X402SettlementQueuedError) {
             // Live AgentAccount queue: keep the hash and reservation so a retry
             // cannot create a second approvable transfer. Never send as proof.
+            entry.txHash = receiptError.txHash;
             this.markSettlementQueued(entry);
             throw receiptError;
           }
@@ -826,6 +828,7 @@ export class X402Client {
           return 'reverted';
         }
         if (receiptError instanceof X402SettlementQueuedError) {
+          entry.txHash = receiptError.txHash;
           this.markSettlementQueued(entry);
           return 'queued';
         }
@@ -866,7 +869,11 @@ export class X402Client {
    *
    * viem resolves a replaced nonce with the *replacement* receipt. A reprice
    * still paid the payee under a new hash; a cancel or unrelated replacement
-   * did not. Adopt the new hash only for `repriced`; fail closed otherwise.
+   * did not. Adopt the new hash only for `repriced`; fail closed on explicit
+   * `cancelled` / `replaced`. A hash mismatch without `onReplaced` is unknown,
+   * not a confirmed revert: the receipt may be a repriced payee transfer whose
+   * callback was dropped. Treating that as reverted would release the
+   * reservation and let a retry double-pay.
    */
   private async waitForSettlementReceipt(txHash: Hash): Promise<Hash> {
     const publicClient = this.wallet?.publicClient;
@@ -914,7 +921,9 @@ export class X402Client {
       && typeof receiptHash === 'string'
       && receiptHash !== txHash
     ) {
-      throw new X402SettlementRevertedError(txHash);
+      throw new Error(
+        `x402 settlement receipt hash mismatch without replacement signal (${txHash} -> ${receiptHash})`,
+      );
     }
     if (x402SettlementReceiptIsQueued(receipt, this.wallet?.address)) {
       throw new X402SettlementQueuedError(adoptedHash);

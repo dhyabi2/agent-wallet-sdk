@@ -982,27 +982,39 @@ describe('X402Client retry idempotency', () => {
     expect(client.getTransactionLog()).toHaveLength(0);
   });
 
-  it('fails closed when a receipt hash changes without onReplaced', async () => {
+  it('keeps a hash-mismatch without onReplaced as unknown so a retry cannot double-pay', async () => {
     const otherHash = ('0x' + '33'.repeat(32)) as `0x${string}`;
-    const waitReceipt = vi.fn(async () => ({
-      status: 'success',
-      transactionHash: otherHash,
-    }));
+    const waitReceipt = vi.fn()
+      .mockResolvedValueOnce({
+        status: 'success',
+        transactionHash: otherHash,
+      })
+      .mockResolvedValue({
+        status: 'success',
+        transactionHash: txHash,
+      });
     const wallet = {
       publicClient: { waitForTransactionReceipt: waitReceipt },
     } as any;
-    vi.spyOn(X402Client.prototype as any, 'executePayment')
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
       .mockResolvedValue({ txHash });
-    const fetchSpy = mock402ThenPaid();
-    const client = new X402Client(wallet);
+    mock402ThenPaid();
+    const client = new X402Client(wallet, { globalDailyLimit: 1000000n });
 
-    await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
-      X402SettlementRevertedError,
-    );
-    expect(
-      fetchSpy.mock.calls.some(([, init]) => new Headers(init?.headers).has('X-PAYMENT')),
-    ).toBe(false);
-    expect(client.getTransactionLog()).toHaveLength(0);
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(waitReceipt).toHaveBeenCalledTimes(2);
+    expect(client.getDailySpendSummary().global).toBe(1000000n);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
+    expect(client.getTransactionLog().map((log) => log.txHash)).toEqual([
+      txHash,
+      txHash,
+    ]);
+    expect(client.getTransactionLog()[1].replayed).toBe(true);
   });
 
   it('keeps the original hash when a success receipt does not rename the transaction', async () => {
