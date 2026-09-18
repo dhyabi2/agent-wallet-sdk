@@ -586,105 +586,145 @@ export class X402Client {
 
   /**
    * A 402 without an explicit intent id is paid once per call once its receipt
-   * is a confirmed success. After a hash is broadcast, keep that hash and its
-   * reservation under this request's unkeyed key until the receipt resolves so
-   * a caller retry of the same resource cannot submit a second transfer.
+   * is a confirmed success. Install the in-flight slot before authorize/execute
+   * so concurrent retries of the same resource share one transfer. After a hash
+   * is broadcast, keep that hash and its reservation under this request's
+   * unkeyed key until the receipt resolves so a later retry cannot pay again.
    */
   private async executeUnkeyedPayment(
     key: string,
     execute: () => Promise<{ txHash: Hash }>,
     authorize: AuthorizeFreshTransfer,
-  ): Promise<{ txHash: Hash; replayed: false; entry?: undefined } | null> {
+  ): Promise<{ txHash: Hash; replayed: boolean; entry?: undefined } | null> {
     this.pruneSettlements();
     const existing = this.paymentSettlements.get(key);
-    if (existing?.txHash) {
-      if (existing.status === 'queued') {
-        this.throwObservedQueued(existing.txHash);
-      }
-      if (existing.status === 'confirmed') {
-        // Background reconfirm already observed success. Deliver that hash
-        // as proof; do not authorize a second transfer.
-        this.paymentSettlements.delete(key);
-        return { txHash: existing.txHash, replayed: false };
-      }
-      if (existing.status === 'unknown') {
-        const confirmation = await this.confirmSubmittedSettlement(
-          key,
-          existing.txHash,
-        );
-        if (confirmation === 'confirmed') {
-          this.paymentSettlements.delete(key);
-          return { txHash: existing.txHash, replayed: false };
-        }
-        if (confirmation === 'queued') {
-          this.throwObservedQueued(existing.txHash);
-        }
-        if (confirmation === 'reverted') {
-          this.throwObservedRevert(key, existing, existing.txHash);
-        }
-        if (existing.unverifiedReplacement) {
-          throw new X402SettlementUnknownError(
-            existing.txHash,
-            `x402 settlement was replaced by a different transaction (${existing.txHash}); outcome unknown, not a confirmed revert`,
-          );
-        }
-        throw new Error(
-          `x402 unkeyed settlement receipt not yet observed (${existing.txHash})`,
-        );
+    if (existing) {
+      const joined = await this.joinUnkeyedSettlement(key, existing);
+      if (joined !== undefined) {
+        return joined;
       }
     }
 
-    const reservationId = await authorize();
-    if (reservationId === null) {
-      return null;
+    const occupied = this.unconfirmedSettlementCount();
+    if (occupied >= X402_MAX_UNCONFIRMED_SETTLEMENTS) {
+      throw new X402SettlementBacklogError(occupied);
     }
-    let installed = false;
-    try {
-      const result = await execute();
-      const entry = {
-        promise: Promise.resolve(result),
-        termsFingerprint: key,
-        retryWindowMs: X402_SETTLEMENT_RETRY_WINDOW_MS,
-        expiresAt: null,
-        status: 'in-flight',
-        txHash: result.txHash,
-        reservationId,
-      } as CachedSettlement;
-      this.paymentSettlements.set(key, entry);
-      installed = true;
-      let settledHash: Hash;
+
+    // Reserve the slot before any await so a concurrent same-resource fetch
+    // joins this flight instead of authorizing a second transfer.
+    const entry = {
+      termsFingerprint: key,
+      retryWindowMs: X402_SETTLEMENT_RETRY_WINDOW_MS,
+      expiresAt: null,
+      status: 'in-flight',
+    } as CachedSettlement;
+    const pending = (async () => {
       try {
-        settledHash = await this.waitForSettlementReceipt(result.txHash);
-      } catch (receiptError) {
-        if (receiptError instanceof X402SettlementRevertedError) {
+        const reservationId = await authorize();
+        if (reservationId === null) {
+          throw X402_POLICY_SKIP;
+        }
+        entry.reservationId = reservationId;
+        let result: { txHash: Hash };
+        try {
+          result = await execute();
+        } catch (error) {
           this.budget.release(reservationId);
-          this.paymentSettlements.delete(key);
-          throw receiptError;
+          throw error;
         }
-        if (receiptError instanceof X402SettlementQueuedError) {
-          entry.txHash = receiptError.txHash;
-          this.markSettlementQueued(entry);
-          throw receiptError;
-        }
-        if (receiptError instanceof X402SettlementUnknownError) {
-          entry.txHash = receiptError.txHash;
+        entry.txHash = result.txHash;
+        try {
+          const settledHash = await this.waitForSettlementReceipt(result.txHash);
+          entry.txHash = settledHash;
+          result = { txHash: settledHash };
+        } catch (receiptError) {
+          if (receiptError instanceof X402SettlementRevertedError) {
+            this.budget.release(reservationId);
+            throw receiptError;
+          }
+          if (receiptError instanceof X402SettlementQueuedError) {
+            entry.txHash = receiptError.txHash;
+            this.markSettlementQueued(entry);
+            throw receiptError;
+          }
+          if (receiptError instanceof X402SettlementUnknownError) {
+            // Replaced or otherwise unverified: keep reserved and do not send
+            // X-PAYMENT. A retry must reconfirm, not broadcast again.
+            entry.txHash = receiptError.txHash;
+            entry.status = 'unknown';
+            entry.unverifiedReplacement = true;
+            throw receiptError;
+          }
           entry.status = 'unknown';
-          entry.unverifiedReplacement = true;
           throw receiptError;
         }
-        entry.status = 'unknown';
-        throw receiptError;
+        this.markSettlementConfirmed(entry);
+        this.paymentSettlements.delete(key);
+        return result;
+      } catch (error) {
+        if (entry.status === 'queued' || entry.status === 'unknown') {
+          throw error;
+        }
+        if (this.paymentSettlements.get(key) === entry) {
+          this.paymentSettlements.delete(key);
+        }
+        throw error;
       }
-      entry.txHash = settledHash;
-      this.markSettlementConfirmed(entry);
-      this.paymentSettlements.delete(key);
-      return { txHash: settledHash, replayed: false };
-    } catch (error) {
-      if (!installed) {
-        this.budget.release(reservationId);
-      }
-      throw error;
+    })();
+    entry.promise = pending;
+    this.paymentSettlements.set(key, entry);
+    const observed = await this.observeSettledPayment(pending, false);
+    return observed ? { txHash: observed.txHash, replayed: false } : null;
+  }
+
+  /**
+   * Observe an already-submitted unkeyed settlement. Returns undefined when
+   * a confirmed-revert tombstone was cleared so the caller may transfer again.
+   */
+  private async joinUnkeyedSettlement(
+    key: string,
+    existing: CachedSettlement,
+  ): Promise<{ txHash: Hash; replayed: boolean; entry?: undefined } | null | undefined> {
+    if (existing.status === 'queued' && existing.txHash) {
+      this.throwObservedQueued(existing.txHash);
     }
+    if (existing.status === 'confirmed' && existing.txHash) {
+      this.paymentSettlements.delete(key);
+      return { txHash: existing.txHash, replayed: false };
+    }
+    if (existing.status === 'unknown' && existing.txHash) {
+      const confirmation = await this.confirmSubmittedSettlement(
+        key,
+        existing.txHash,
+      );
+      if (confirmation === 'confirmed') {
+        this.paymentSettlements.delete(key);
+        return { txHash: existing.txHash, replayed: false };
+      }
+      if (confirmation === 'queued') {
+        this.throwObservedQueued(existing.txHash);
+      }
+      if (confirmation === 'reverted') {
+        this.throwObservedRevert(key, existing, existing.txHash);
+      }
+      if (existing.unverifiedReplacement) {
+        throw new X402SettlementUnknownError(
+          existing.txHash,
+          `x402 settlement was replaced by a different transaction (${existing.txHash}); outcome unknown, not a confirmed revert`,
+        );
+      }
+      throw new Error(
+        `x402 unkeyed settlement receipt not yet observed (${existing.txHash})`,
+      );
+    }
+    if (existing.status === 'reverted') {
+      if (this.paymentSettlements.get(key) === existing) {
+        this.paymentSettlements.delete(key);
+      }
+      return undefined;
+    }
+    const observed = await this.observeSettledPayment(existing.promise, true);
+    return observed ? { txHash: observed.txHash, replayed: true } : null;
   }
 
   private async settlePayment(
