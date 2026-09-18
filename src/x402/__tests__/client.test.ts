@@ -1130,6 +1130,40 @@ describe('X402Client retry idempotency', () => {
     );
     expect(executeSpy).toHaveBeenCalledTimes(1);
     expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+    expect(waitReceipt.mock.calls.every(([arg]) => arg.hash === txHash)).toBe(true);
+    expect(waitReceipt.mock.calls.some(([arg]) => arg.hash === replacedHash)).toBe(false);
+  });
+
+  it('releases the reservation when a replacement receipt is reverted', async () => {
+    const replacedHash = ('0x' + '22'.repeat(32)) as `0x${string}`;
+    const waitReceipt = vi.fn(async ({
+      onReplaced,
+    }: {
+      hash: string;
+      onReplaced?: (event: {
+        reason: string;
+        transactionReceipt: { status: string; transactionHash: string };
+      }) => void;
+    }) => {
+      onReplaced?.({
+        reason: 'replaced',
+        transactionReceipt: { status: 'reverted', transactionHash: replacedHash },
+      });
+      return { status: 'reverted', transactionHash: replacedHash };
+    });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    mock402ThenPaid();
+    const client = new X402Client(wallet, { globalDailyLimit: 1000000n });
+
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementRevertedError,
+    );
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
   });
 
   it('keeps a hash-mismatch without onReplaced as unknown so a retry cannot double-pay', async () => {

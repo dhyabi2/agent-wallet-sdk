@@ -866,6 +866,9 @@ export class X402Client {
       } catch (receiptError) {
         if (receiptError instanceof X402SettlementRevertedError) {
           entry.txHash = receiptError.txHash;
+          if (entry.log) {
+            entry.log.txHash = receiptError.txHash;
+          }
           this.markSettlementReverted(entry);
           return 'reverted';
         }
@@ -950,17 +953,22 @@ export class X402Client {
     const adoptedHash = replacementReason === 'repriced'
       ? (replacementHash ?? (typeof receiptHash === 'string' ? receiptHash : txHash))
       : txHash;
+    // A mined revert is definitive even when the nonce was reused. Check it
+    // before classifying a successful unrelated replacement as unknown.
+    if (receipt?.status === 'reverted') {
+      throw new X402SettlementRevertedError(adoptedHash);
+    }
     if (replacementReason === 'cancelled') {
       throw new X402SettlementRevertedError(adoptedHash);
     }
     if (replacementReason === 'replaced') {
+      // Keep the original hash so later reconfirm still observes the replacement
+      // relationship. Adopting replacementHash would let a later wait treat the
+      // unrelated success receipt as the payment.
       throw new X402SettlementUnknownError(
-        replacementHash ?? txHash,
+        txHash,
         `x402 settlement was replaced by a different transaction (${txHash}); outcome unknown, not a confirmed revert`,
       );
-    }
-    if (receipt?.status === 'reverted') {
-      throw new X402SettlementRevertedError(adoptedHash);
     }
     if (!receipt || receipt.status !== 'success') {
       throw new Error(
