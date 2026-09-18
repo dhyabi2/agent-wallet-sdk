@@ -658,6 +658,11 @@ export class X402Client {
           this.markSettlementQueued(entry);
           throw receiptError;
         }
+        if (receiptError instanceof X402SettlementUnknownError) {
+          entry.txHash = receiptError.txHash;
+          entry.status = 'unknown';
+          throw receiptError;
+        }
         entry.status = 'unknown';
         throw receiptError;
       }
@@ -786,6 +791,13 @@ export class X402Client {
             this.markSettlementQueued(entry);
             throw receiptError;
           }
+          if (receiptError instanceof X402SettlementUnknownError) {
+            // Replaced or otherwise unverified: keep reserved and do not send
+            // X-PAYMENT. A retry must reconfirm, not broadcast again.
+            entry.txHash = receiptError.txHash;
+            entry.status = 'unknown';
+            throw receiptError;
+          }
           // Broadcast already happened but the outcome is unknown (RPC
           // timeout, missing receipt). Keep the hash and its reservation so a
           // retry replays instead of paying twice, and keep confirming it.
@@ -853,6 +865,7 @@ export class X402Client {
         return 'confirmed';
       } catch (receiptError) {
         if (receiptError instanceof X402SettlementRevertedError) {
+          entry.txHash = receiptError.txHash;
           this.markSettlementReverted(entry);
           return 'reverted';
         }
@@ -860,6 +873,11 @@ export class X402Client {
           entry.txHash = receiptError.txHash;
           this.markSettlementQueued(entry);
           return 'queued';
+        }
+        if (receiptError instanceof X402SettlementUnknownError) {
+          entry.txHash = receiptError.txHash;
+          entry.status = 'unknown';
+          return 'unknown';
         }
         const failures = (entry.reconfirmFailures ?? 0) + 1;
         entry.reconfirmFailures = failures;
@@ -897,12 +915,12 @@ export class X402Client {
    * cannot broadcast a second fee+payee transfer.
    *
    * viem resolves a replaced nonce with the *replacement* receipt. A reprice
-   * still paid the payee under a new hash; a cancel or unrelated replacement
-   * did not. Adopt the new hash only for `repriced`; fail closed on explicit
-   * `cancelled` / `replaced`. A hash mismatch without `onReplaced` is unknown,
-   * not a confirmed revert: the receipt may be a repriced payee transfer whose
-   * callback was dropped. Treating that as reverted would release the
-   * reservation and let a retry double-pay.
+   * still paid the payee under a new hash -- adopt it. An explicit `cancelled`
+   * is a confirmed non-payment. An explicit `replaced` only proves the nonce
+   * was reused with different destination/value/data; that replacement can
+   * still have transferred the requested token (for example via agentExecute).
+   * Treat `replaced` as unknown so the reservation stays and a retry cannot
+   * pay again. A hash mismatch without `onReplaced` is also unknown.
    */
   private async waitForSettlementReceipt(txHash: Hash): Promise<Hash> {
     const publicClient = this.wallet?.publicClient;
@@ -928,11 +946,21 @@ export class X402Client {
         }
       },
     }) as SettlementReceipt | null;
-    if (replacementReason === 'cancelled' || replacementReason === 'replaced') {
-      throw new X402SettlementRevertedError(txHash);
+    const receiptHash = receipt?.transactionHash;
+    const adoptedHash = replacementReason === 'repriced'
+      ? (replacementHash ?? (typeof receiptHash === 'string' ? receiptHash : txHash))
+      : txHash;
+    if (replacementReason === 'cancelled') {
+      throw new X402SettlementRevertedError(adoptedHash);
+    }
+    if (replacementReason === 'replaced') {
+      throw new X402SettlementUnknownError(
+        replacementHash ?? txHash,
+        `x402 settlement was replaced by a different transaction (${txHash}); outcome unknown, not a confirmed revert`,
+      );
     }
     if (receipt?.status === 'reverted') {
-      throw new X402SettlementRevertedError(txHash);
+      throw new X402SettlementRevertedError(adoptedHash);
     }
     if (!receipt || receipt.status !== 'success') {
       throw new Error(
@@ -941,10 +969,6 @@ export class X402Client {
           : `x402 settlement receipt missing (${txHash})`,
       );
     }
-    const receiptHash = receipt.transactionHash;
-    const adoptedHash = replacementReason === 'repriced'
-      ? (replacementHash ?? (typeof receiptHash === 'string' ? receiptHash : txHash))
-      : txHash;
     if (
       replacementReason !== 'repriced'
       && typeof receiptHash === 'string'
@@ -1077,6 +1101,9 @@ export class X402Client {
       entry.txHash = await this.waitForSettlementReceipt(entry.txHash);
       entry.status = 'confirmed';
     } catch (error) {
+      if (error instanceof X402SettlementQueuedError || error instanceof X402SettlementUnknownError) {
+        entry.txHash = error.txHash;
+      }
       if (error instanceof X402SettlementRevertedError) {
         this.feePhases.delete(key);
       }
@@ -1215,6 +1242,14 @@ export class X402SettlementQueuedError extends Error {
   constructor(public readonly txHash: Hash) {
     super(`x402 settlement was queued for owner approval (${txHash})`);
     this.name = 'X402SettlementQueuedError';
+  }
+}
+
+/** Replacement or other non-final outcome: keep reserved, never send as proof. */
+export class X402SettlementUnknownError extends Error {
+  constructor(public readonly txHash: Hash, message?: string) {
+    super(message ?? `x402 settlement outcome unknown (${txHash})`);
+    this.name = 'X402SettlementUnknownError';
   }
 }
 

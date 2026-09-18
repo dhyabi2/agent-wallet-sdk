@@ -38,6 +38,7 @@ export {
   X402BudgetExceededError,
   X402SettlementRevertedError,
   X402SettlementQueuedError,
+  X402SettlementUnknownError,
   X402SettlementBacklogError,
   X402IntentTermsConflictError,
   createX402Client,

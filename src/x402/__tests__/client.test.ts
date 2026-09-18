@@ -6,6 +6,7 @@ import {
   X402IntentTermsConflictError,
   X402SettlementRevertedError,
   X402SettlementQueuedError,
+  X402SettlementUnknownError,
   buildX402PaymentIdempotencyKey,
   buildX402PaymentIntentKey,
   canonicalizeX402Amount,
@@ -1089,7 +1090,7 @@ describe('X402Client retry idempotency', () => {
     ).toBe(false);
   });
 
-  it('fails closed when a pending settlement is replaced by an unrelated transaction', async () => {
+  it('keeps a replaced settlement reserved so a retry cannot double-pay', async () => {
     const replacedHash = ('0x' + '22'.repeat(32)) as `0x${string}`;
     const waitReceipt = vi.fn(async ({
       onReplaced,
@@ -1109,18 +1110,26 @@ describe('X402Client retry idempotency', () => {
     const wallet = {
       publicClient: { waitForTransactionReceipt: waitReceipt },
     } as any;
-    vi.spyOn(X402Client.prototype as any, 'executePayment')
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
       .mockResolvedValue({ txHash });
     const fetchSpy = mock402ThenPaid();
-    const client = new X402Client(wallet);
+    const client = new X402Client(wallet, { globalDailyLimit: 1000000n });
 
     await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
-      X402SettlementRevertedError,
+      X402SettlementUnknownError,
     );
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
     expect(
       fetchSpy.mock.calls.some(([, init]) => new Headers(init?.headers).has('X-PAYMENT')),
     ).toBe(false);
     expect(client.getTransactionLog()).toHaveLength(0);
+
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementUnknownError,
+    );
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
   });
 
   it('keeps a hash-mismatch without onReplaced as unknown so a retry cannot double-pay', async () => {
@@ -2031,10 +2040,12 @@ describe('X402Client retry idempotency', () => {
     const rootBarrel = await import('../../index.js');
     expect(x402Barrel.X402SettlementRevertedError).toBe(X402SettlementRevertedError);
     expect(x402Barrel.X402SettlementQueuedError).toBe(X402SettlementQueuedError);
+    expect(x402Barrel.X402SettlementUnknownError).toBe(X402SettlementUnknownError);
     expect(x402Barrel.X402IntentTermsConflictError).toBe(X402IntentTermsConflictError);
     expect(x402Barrel.X402SettlementBacklogError).toBe(X402SettlementBacklogError);
     expect(rootBarrel.X402SettlementRevertedError).toBe(X402SettlementRevertedError);
     expect(rootBarrel.X402SettlementQueuedError).toBe(X402SettlementQueuedError);
+    expect(rootBarrel.X402SettlementUnknownError).toBe(X402SettlementUnknownError);
     expect(rootBarrel.X402IntentTermsConflictError).toBe(X402IntentTermsConflictError);
     expect(rootBarrel.X402SettlementBacklogError).toBe(X402SettlementBacklogError);
   });
