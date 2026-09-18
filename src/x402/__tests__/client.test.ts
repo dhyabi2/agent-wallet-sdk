@@ -6,6 +6,7 @@ import {
   X402IntentTermsConflictError,
   X402SettlementRevertedError,
   X402SettlementQueuedError,
+  X402SettlementUnknownError,
   buildX402PaymentIdempotencyKey,
   buildX402PaymentIntentKey,
   canonicalizeX402Amount,
@@ -1089,7 +1090,7 @@ describe('X402Client retry idempotency', () => {
     ).toBe(false);
   });
 
-  it('fails closed when a pending settlement is replaced by an unrelated transaction', async () => {
+  it('keeps a replaced settlement reserved so a retry cannot double-pay', async () => {
     const replacedHash = ('0x' + '22'.repeat(32)) as `0x${string}`;
     const waitReceipt = vi.fn(async ({
       onReplaced,
@@ -1109,18 +1110,108 @@ describe('X402Client retry idempotency', () => {
     const wallet = {
       publicClient: { waitForTransactionReceipt: waitReceipt },
     } as any;
-    vi.spyOn(X402Client.prototype as any, 'executePayment')
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
       .mockResolvedValue({ txHash });
     const fetchSpy = mock402ThenPaid();
-    const client = new X402Client(wallet);
+    const client = new X402Client(wallet, { globalDailyLimit: 1000000n });
 
     await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
-      X402SettlementRevertedError,
+      X402SettlementUnknownError,
     );
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
     expect(
       fetchSpy.mock.calls.some(([, init]) => new Headers(init?.headers).has('X-PAYMENT')),
     ).toBe(false);
     expect(client.getTransactionLog()).toHaveLength(0);
+
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementUnknownError,
+    );
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+    expect(waitReceipt.mock.calls.every(([arg]) => arg.hash === txHash)).toBe(true);
+    expect(waitReceipt.mock.calls.some(([arg]) => arg.hash === replacedHash)).toBe(false);
+  });
+
+  it('releases the reservation when a replacement receipt is reverted', async () => {
+    const replacedHash = ('0x' + '22'.repeat(32)) as `0x${string}`;
+    const waitReceipt = vi.fn(async ({
+      onReplaced,
+    }: {
+      hash: string;
+      onReplaced?: (event: {
+        reason: string;
+        transactionReceipt: { status: string; transactionHash: string };
+      }) => void;
+    }) => {
+      onReplaced?.({
+        reason: 'replaced',
+        transactionReceipt: { status: 'reverted', transactionHash: replacedHash },
+      });
+      return { status: 'reverted', transactionHash: replacedHash };
+    });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    mock402ThenPaid();
+    const client = new X402Client(wallet, { globalDailyLimit: 1000000n });
+
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toMatchObject({
+      name: 'X402SettlementRevertedError',
+      txHash: replacedHash,
+    });
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
+  });
+
+  it('surfaces a queued replacement as queued instead of unknown', async () => {
+    const replacedHash = ('0x' + '22'.repeat(32)) as `0x${string}`;
+    const walletAddress = '0x2222222222222222222222222222222222222222';
+    const waitReceipt = vi.fn(async ({
+      onReplaced,
+    }: {
+      hash: string;
+      onReplaced?: (event: {
+        reason: string;
+        transactionReceipt: { status: string; transactionHash: string };
+      }) => void;
+    }) => {
+      onReplaced?.({
+        reason: 'replaced',
+        transactionReceipt: { status: 'success', transactionHash: replacedHash },
+      });
+      return {
+        status: 'success',
+        transactionHash: replacedHash,
+        logs: [
+          {
+            address: walletAddress,
+            topics: [X402_TRANSACTION_QUEUED_TOPIC],
+          },
+        ],
+      };
+    });
+    const wallet = {
+      address: walletAddress,
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    mock402ThenPaid();
+    const client = new X402Client(wallet, { globalDailyLimit: 1000000n });
+
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementQueuedError,
+    );
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementQueuedError,
+    );
+    expect(executeSpy).toHaveBeenCalledTimes(1);
   });
 
   it('keeps a hash-mismatch without onReplaced as unknown so a retry cannot double-pay', async () => {
@@ -1530,6 +1621,63 @@ describe('X402Client retry idempotency', () => {
       });
     });
   }
+
+  it('backs off opportunistic reconfirm of a replaced settlement', async () => {
+    vi.useFakeTimers();
+    const txA = ('0x' + 'aa'.repeat(32)) as `0x${string}`;
+    const txOther = ('0x' + 'bb'.repeat(32)) as `0x${string}`;
+    const replacedHash = ('0x' + '22'.repeat(32)) as `0x${string}`;
+    const waitReceipt = vi.fn(async ({
+      hash,
+      onReplaced,
+    }: {
+      hash: string;
+      onReplaced?: (event: {
+        reason: string;
+        transactionReceipt: { status: string; transactionHash: string };
+      }) => void;
+    }) => {
+      if (hash === txA) {
+        onReplaced?.({
+          reason: 'replaced',
+          transactionReceipt: { status: 'success', transactionHash: replacedHash },
+        });
+        return { status: 'success', transactionHash: replacedHash };
+      }
+      return { status: 'success' };
+    });
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockImplementation(async (...args: unknown[]) => {
+        const selected = args[0] as { extra?: { nonce?: string } } | undefined;
+        return { txHash: selected?.extra?.nonce === 'intent-a' ? txA : txOther };
+      });
+    mock402PerIntent();
+    const client = new X402Client(wallet, { globalDailyLimit: 5000000n });
+    const attemptsForA = () => waitReceipt.mock.calls.filter((call) => call[0].hash === txA).length;
+
+    await expect(client.fetch(`${url}?n=intent-a`, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementUnknownError,
+    );
+    expect(attemptsForA()).toBe(1);
+
+    expect((await client.fetch(`${url}?n=intent-b`, { method: 'POST' })).status).toBe(200);
+    expect(attemptsForA()).toBe(2);
+
+    expect((await client.fetch(`${url}?n=intent-c`, { method: 'POST' })).status).toBe(200);
+    expect(attemptsForA()).toBe(2);
+
+    vi.advanceTimersByTime(X402_RECONFIRM_BACKOFF_MS + 1);
+    expect((await client.fetch(`${url}?n=intent-d`, { method: 'POST' })).status).toBe(200);
+    expect(attemptsForA()).toBe(3);
+
+    await expect(client.fetch(`${url}?n=intent-a`, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementUnknownError,
+    );
+    expect(attemptsForA()).toBe(4);
+  });
 
   it('reserves budget atomically so concurrent distinct intents cannot both pass one limit', async () => {
     let releasePolicy: (value: boolean) => void = () => {};
@@ -2031,10 +2179,12 @@ describe('X402Client retry idempotency', () => {
     const rootBarrel = await import('../../index.js');
     expect(x402Barrel.X402SettlementRevertedError).toBe(X402SettlementRevertedError);
     expect(x402Barrel.X402SettlementQueuedError).toBe(X402SettlementQueuedError);
+    expect(x402Barrel.X402SettlementUnknownError).toBe(X402SettlementUnknownError);
     expect(x402Barrel.X402IntentTermsConflictError).toBe(X402IntentTermsConflictError);
     expect(x402Barrel.X402SettlementBacklogError).toBe(X402SettlementBacklogError);
     expect(rootBarrel.X402SettlementRevertedError).toBe(X402SettlementRevertedError);
     expect(rootBarrel.X402SettlementQueuedError).toBe(X402SettlementQueuedError);
+    expect(rootBarrel.X402SettlementUnknownError).toBe(X402SettlementUnknownError);
     expect(rootBarrel.X402IntentTermsConflictError).toBe(X402IntentTermsConflictError);
     expect(rootBarrel.X402SettlementBacklogError).toBe(X402SettlementBacklogError);
   });
