@@ -210,14 +210,54 @@ export function buildX402PaymentTermsFingerprint(req: X402PaymentRequirements): 
 }
 
 /**
+ * Synchronous content fingerprint for a fetch body. Returns undefined when the
+ * body cannot be read without consuming it (Blob, FormData, ReadableStream).
+ * Empty / missing bodies share one identity so a GET/POST retry still joins.
+ */
+export function fingerprintReadableX402RequestBody(
+  body: BodyInit | null | undefined,
+): string | undefined {
+  if (body == null) {
+    return '';
+  }
+  if (typeof body === 'string') {
+    return `s:${body}`;
+  }
+  if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+    return `q:${body.toString()}`;
+  }
+  if (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer) {
+    return `b:${fingerprintX402RequestBytes(new Uint8Array(body))}`;
+  }
+  if (ArrayBuffer.isView(body)) {
+    return `b:${fingerprintX402RequestBytes(
+      new Uint8Array(body.buffer, body.byteOffset, body.byteLength),
+    )}`;
+  }
+  return undefined;
+}
+
+/** Length + 64-bit FNV-1a so two byte bodies only share a key when they match. */
+function fingerprintX402RequestBytes(bytes: Uint8Array): string {
+  let hash = 0xcbf29ce484222325n;
+  for (let i = 0; i < bytes.length; i += 1) {
+    hash ^= BigInt(bytes[i]);
+    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return `${bytes.length}:${hash.toString(16)}`;
+}
+
+/**
  * Cache key for a 402 that carries no explicit intent id. Scoped to method +
- * URL + terms so an unresolved unkeyed broadcast cannot be reused as proof
- * for a different resource, and cannot block a later unrelated payment.
+ * URL + terms + request identity so an unresolved unkeyed broadcast cannot be
+ * reused as proof for a different resource or a different POST body, and
+ * cannot block a later unrelated payment.
  */
 export function buildUnkeyedPendingKey(
   method: string,
   url: string | URL,
   termsFingerprint: string,
+  requestFingerprint: string = '',
 ): string {
   const normalizedMethod = method.trim().toUpperCase() || 'GET';
   return [
@@ -225,6 +265,7 @@ export function buildUnkeyedPendingKey(
     encodeX402KeyField(normalizedMethod),
     encodeX402KeyField(canonicalizeX402RequestUrl(url)),
     termsFingerprint,
+    encodeX402KeyField(requestFingerprint),
   ].join('|');
 }
 
@@ -307,6 +348,8 @@ export class X402Client {
   /** Protocol-fee hashes keyed by explicit intent; survives payee-revert eviction. */
   private feePhases = new Map<string, CachedFeePhase>();
   private unkeyedIntentSequence = 0;
+  /** Object-identity fallback for bodies that cannot be fingerprinted synchronously. */
+  private unreadableRequestIds = new WeakMap<object, string>();
 
   constructor(wallet: any, config: X402ClientConfig = {}) {
     this.wallet = wallet;
@@ -398,7 +441,12 @@ export class X402Client {
           Math.max(X402_SETTLEMENT_RETRY_WINDOW_MS, selected.maxTimeoutSeconds * 1000),
         )
       : await this.executeUnkeyedPayment(
-          buildUnkeyedPendingKey(method, urlStr, termsFingerprint),
+          buildUnkeyedPendingKey(
+            method,
+            urlStr,
+            termsFingerprint,
+            this.fingerprintUnkeyedRequest(init),
+          ),
           () => this.executePayment(selected),
           authorizeFreshTransfer,
         );
@@ -456,6 +504,30 @@ export class X402Client {
     });
 
     return retryResponse;
+  }
+
+  /**
+   * Identity for an unkeyed settlement slot. Readable bodies compare by
+   * content so a retry of the same POST joins; distinct bodies pay separately.
+   * Unreadable bodies (Blob / FormData / stream) are keyed by object identity
+   * so two different instances never share a transfer.
+   */
+  private fingerprintUnkeyedRequest(init?: RequestInit): string {
+    const readable = fingerprintReadableX402RequestBody(init?.body);
+    if (readable !== undefined) {
+      return readable;
+    }
+    const body = init?.body;
+    if (body === undefined || body === null || typeof body !== 'object') {
+      return '';
+    }
+    const existing = this.unreadableRequestIds.get(body);
+    if (existing) {
+      return existing;
+    }
+    const id = `o:${this.nextUnkeyedIntentId()}`;
+    this.unreadableRequestIds.set(body, id);
+    return id;
   }
 
   /** Unique-per-client fallback for 402s that carry no explicit intent id. */
@@ -587,9 +659,10 @@ export class X402Client {
   /**
    * A 402 without an explicit intent id is paid once per call once its receipt
    * is a confirmed success. Install the in-flight slot before authorize/execute
-   * so concurrent retries of the same resource share one transfer. After a hash
-   * is broadcast, keep that hash and its reservation under this request's
-   * unkeyed key until the receipt resolves so a later retry cannot pay again.
+   * so concurrent retries of the same request identity share one transfer.
+   * Distinct POST bodies do not join. After a hash is broadcast, keep that hash
+   * and its reservation under this request's unkeyed key until the receipt
+   * resolves so a later retry of that same request cannot pay again.
    */
   private async executeUnkeyedPayment(
     key: string,
