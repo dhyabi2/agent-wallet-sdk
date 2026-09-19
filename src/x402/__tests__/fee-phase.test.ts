@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { X402Client, X402SettlementRevertedError } from '../client.js';
+import {
+  X402Client,
+  X402SettlementQueuedError,
+  X402SettlementRevertedError,
+  X402SettlementUnknownError,
+  X402_TRANSACTION_QUEUED_TOPIC,
+} from '../client.js';
 
 const FEE_COLLECTOR = '0xff86829393C6C26A4EC122bE0Cc3E466Ef876AdD';
 const USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
@@ -42,7 +48,7 @@ function paymentRequired(extra: Record<string, string> = { nonce: 'intent-fee' }
   };
 }
 
-function mock402ThenPaid() {
+function mock402ThenPaid(extra: Record<string, string> = { nonce: 'intent-fee' }) {
   return vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
     const headers = new Headers(init?.headers);
     if (headers.get('X-PAYMENT')) {
@@ -50,7 +56,7 @@ function mock402ThenPaid() {
     }
     return new Response(null, {
       status: 402,
-      headers: { 'payment-required': btoa(JSON.stringify(paymentRequired())) },
+      headers: { 'payment-required': btoa(JSON.stringify(paymentRequired(extra))) },
     });
   });
 }
@@ -65,6 +71,7 @@ describe('X402Client protocol-fee phase (#50)', () => {
   function setupTransfers(opts: {
     feeReceipts: Array<'success' | 'reverted'>;
     payeeReceipts: Array<'success' | 'reverted'>;
+    unkeyed?: boolean;
   }) {
     const feeHashes = opts.feeReceipts.map((_, i) => hash((10 + i).toString(16).padStart(2, '0')));
     const payeeHashes = opts.payeeReceipts.map((_, i) => hash((20 + i).toString(16).padStart(2, '0')));
@@ -97,7 +104,7 @@ describe('X402Client protocol-fee phase (#50)', () => {
         },
       },
     };
-    mock402ThenPaid();
+    mock402ThenPaid(opts.unkeyed ? {} : undefined);
     return { wallet, feeHashes, payeeHashes };
   }
 
@@ -106,7 +113,7 @@ describe('X402Client protocol-fee phase (#50)', () => {
       feeReceipts: ['success'],
       payeeReceipts: ['reverted', 'success'],
     });
-    const client = new X402Client(wallet as any);
+    const client = new X402Client(wallet);
 
     await expect(client.fetch(URL, { method: 'POST' })).rejects.toBeInstanceOf(
       X402SettlementRevertedError,
@@ -133,7 +140,7 @@ describe('X402Client protocol-fee phase (#50)', () => {
       feeReceipts: ['reverted', 'success'],
       payeeReceipts: ['success'],
     });
-    const client = new X402Client(wallet as any);
+    const client = new X402Client(wallet);
 
     await expect(client.fetch(URL, { method: 'POST' })).rejects.toBeInstanceOf(
       X402SettlementRevertedError,
@@ -155,7 +162,7 @@ describe('X402Client protocol-fee phase (#50)', () => {
       feeReceipts: ['success'],
       payeeReceipts: ['success'],
     });
-    const client = new X402Client(wallet as any);
+    const client = new X402Client(wallet);
 
     expect((await client.fetch(URL, { method: 'POST' })).status).toBe(200);
     expect((await client.fetch(URL, { method: 'POST' })).status).toBe(200);
@@ -187,7 +194,7 @@ describe('X402Client protocol-fee phase (#50)', () => {
       }
       return originalWait(args);
     };
-    const client = new X402Client(wallet as any);
+    const client = new X402Client(wallet);
 
     await expect(client.fetch(URL, { method: 'POST' })).rejects.toThrow('rpc timeout');
     expect(transfer.mock.calls).toHaveLength(1);
@@ -199,6 +206,173 @@ describe('X402Client protocol-fee phase (#50)', () => {
     expect(isFeeTransfer(transfer.mock.calls[1][1])).toBe(false);
     expect(feeReceiptAttempts).toBe(2);
     expect(client.getTransactionLog()).toHaveLength(1);
+  });
+
+  it('resumes an unkeyed fee confirmation without a second fee or reservation', async () => {
+    const { wallet, feeHashes } = setupTransfers({
+      feeReceipts: ['success'],
+      payeeReceipts: ['success'],
+      unkeyed: true,
+    });
+    let feeReceiptAttempts = 0;
+    const originalWait = wallet.publicClient.waitForTransactionReceipt;
+    wallet.publicClient.waitForTransactionReceipt = async (args: { hash: string }) => {
+      if (args.hash === feeHashes[0]) {
+        feeReceiptAttempts += 1;
+        if (feeReceiptAttempts === 1) {
+          throw new Error('rpc timeout');
+        }
+      }
+      return originalWait(args);
+    };
+    const client = new X402Client(wallet);
+
+    await expect(client.fetch(URL, { method: 'POST' })).rejects.toThrow('rpc timeout');
+    expect(transfer.mock.calls).toHaveLength(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+
+    const retry = await client.fetch(URL, { method: 'POST' });
+    expect(retry.status).toBe(200);
+    expect(transfer.mock.calls).toHaveLength(2);
+    expect(transfer.mock.calls.filter((call) => isFeeTransfer(call[1]))).toHaveLength(1);
+    expect(feeReceiptAttempts).toBe(2);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
+    expect(client.getTransactionLog()).toHaveLength(1);
+    expect(client.getTransactionLog()[0].replayed).toBe(false);
+  });
+
+  it('single-flights concurrent retries while an unkeyed fee receipt is pending', async () => {
+    const { wallet, feeHashes } = setupTransfers({
+      feeReceipts: ['success'],
+      payeeReceipts: ['success'],
+      unkeyed: true,
+    });
+    let feeReceiptAttempts = 0;
+    let releaseFeeReceipt: (receipt: { status: 'success' | 'reverted' }) => void = () => {};
+    const delayedFeeReceipt = new Promise<{ status: 'success' | 'reverted' }>((resolve) => {
+      releaseFeeReceipt = resolve;
+    });
+    const originalWait = wallet.publicClient.waitForTransactionReceipt;
+    wallet.publicClient.waitForTransactionReceipt = async (args: { hash: string }) => {
+      if (args.hash === feeHashes[0]) {
+        feeReceiptAttempts += 1;
+        if (feeReceiptAttempts === 1) {
+          throw new Error('rpc timeout');
+        }
+        if (feeReceiptAttempts === 2) {
+          return delayedFeeReceipt;
+        }
+      }
+      return originalWait(args);
+    };
+    const client = new X402Client(wallet);
+
+    await expect(client.fetch(URL, { method: 'POST' })).rejects.toThrow('rpc timeout');
+    const retries = Promise.all([
+      client.fetch(URL, { method: 'POST' }),
+      client.fetch(URL, { method: 'POST' }),
+    ]);
+    await vi.waitFor(() => expect(feeReceiptAttempts).toBe(2));
+    releaseFeeReceipt({ status: 'success' });
+
+    const responses = await retries;
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(feeReceiptAttempts).toBe(2);
+    expect(transfer.mock.calls.filter((call) => isFeeTransfer(call[1]))).toHaveLength(1);
+    expect(transfer.mock.calls.filter((call) => !isFeeTransfer(call[1]))).toHaveLength(1);
+    const logs = client.getTransactionLog();
+    expect(logs).toHaveLength(2);
+    expect(logs.filter((log) => log.replayed)).toHaveLength(1);
+  });
+
+  it('keeps a replaced fee reserved and never presents it as payment proof', async () => {
+    const { wallet, feeHashes } = setupTransfers({
+      feeReceipts: ['success'],
+      payeeReceipts: ['success'],
+    });
+    const replacementHash = hash('55');
+    const originalWait = wallet.publicClient.waitForTransactionReceipt;
+    wallet.publicClient.waitForTransactionReceipt = async ({
+      hash: txHash,
+      onReplaced,
+    }: {
+      hash: string;
+      onReplaced?: (event: { reason: string; transactionReceipt: { status: string; transactionHash: string } }) => void;
+    }) => {
+      if (txHash === feeHashes[0]) {
+        onReplaced?.({
+          reason: 'replaced',
+          transactionReceipt: { status: 'success', transactionHash: replacementHash },
+        });
+        return { status: 'success', transactionHash: replacementHash };
+      }
+      return originalWait({ hash: txHash });
+    };
+    const client = new X402Client(wallet);
+
+    await expect(client.fetch(URL, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementUnknownError,
+    );
+    await expect(client.fetch(URL, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementUnknownError,
+    );
+
+    expect(transfer.mock.calls).toHaveLength(1);
+    expect(isFeeTransfer(transfer.mock.calls[0][1])).toBe(true);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+    expect(client.getTransactionLog()).toHaveLength(0);
+  });
+
+  it('keeps a queued fee blocked instead of inferring a payee confirmation', async () => {
+    const { wallet, feeHashes } = setupTransfers({
+      feeReceipts: ['success'],
+      payeeReceipts: ['success'],
+    });
+    const originalWait = wallet.publicClient.waitForTransactionReceipt;
+    wallet.publicClient.waitForTransactionReceipt = async ({ hash: txHash }: { hash: string }) => {
+      if (txHash === feeHashes[0]) {
+        return { status: 'success', logs: [{ topics: [X402_TRANSACTION_QUEUED_TOPIC] }] };
+      }
+      return originalWait({ hash: txHash });
+    };
+    const client = new X402Client(wallet);
+
+    await expect(client.fetch(URL, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementQueuedError,
+    );
+    await expect(client.fetch(URL, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementQueuedError,
+    );
+
+    expect(transfer.mock.calls).toHaveLength(1);
+    expect(isFeeTransfer(transfer.mock.calls[0][1])).toBe(true);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+    expect(client.getTransactionLog()).toHaveLength(0);
+  });
+
+  it('clears an unkeyed fee phase after delayed payee confirmation', async () => {
+    const { wallet, payeeHashes } = setupTransfers({
+      feeReceipts: ['success', 'success'],
+      payeeReceipts: ['success', 'success'],
+      unkeyed: true,
+    });
+    let firstPayeeReceipt = true;
+    const originalWait = wallet.publicClient.waitForTransactionReceipt;
+    wallet.publicClient.waitForTransactionReceipt = async (args: { hash: string }) => {
+      if (args.hash === payeeHashes[0] && firstPayeeReceipt) {
+        firstPayeeReceipt = false;
+        throw new Error('payee receipt timeout');
+      }
+      return originalWait(args);
+    };
+    const client = new X402Client(wallet);
+
+    await expect(client.fetch(URL, { method: 'POST' })).rejects.toThrow('payee receipt timeout');
+    expect((await client.fetch(URL, { method: 'POST' })).status).toBe(200);
+    expect((await client.fetch(URL, { method: 'POST' })).status).toBe(200);
+
+    expect(transfer.mock.calls.filter((call) => isFeeTransfer(call[1]))).toHaveLength(2);
+    expect(transfer.mock.calls.filter((call) => !isFeeTransfer(call[1]))).toHaveLength(2);
   });
 
   it('expires a confirmed fee phase with its completed settlement', async () => {
