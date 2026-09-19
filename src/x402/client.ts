@@ -268,9 +268,26 @@ export function fingerprintX402RequestHeaders(headers?: HeadersInit): string {
 }
 
 /**
+ * Hash request options that can change the caller context the server sees.
+ * Defaults are explicit so an omitted credential mode joins its equivalent
+ * `same-origin` spelling, while ambient cookie contents remain outside the
+ * client-visible RequestInit snapshot.
+ */
+function fingerprintX402RequestContext(init?: RequestInit): string {
+  const canonical = [
+    fingerprintX402RequestHeaders(init?.headers),
+    init?.credentials ?? 'same-origin',
+    init?.mode ?? 'cors',
+    init?.referrer ?? 'about:client',
+    init?.referrerPolicy ?? '',
+  ].map(encodeX402KeyField).join('');
+  return fingerprintX402RequestBytes(new TextEncoder().encode(canonical));
+}
+
+/**
  * Cache key for a 402 that carries no explicit intent id. Scoped to method +
  * URL + terms + request identity so an unresolved unkeyed broadcast cannot be
- * reused as proof for a different resource, body, or caller headers, and it
+ * reused as proof for a different resource, body, or caller context, and it
  * cannot block a later unrelated payment.
  */
 export function buildUnkeyedPendingKey(
@@ -583,24 +600,24 @@ export class X402Client {
    */
   private fingerprintUnkeyedRequest(init?: RequestInit): string {
     const readable = fingerprintReadableX402RequestBody(init?.body);
-    const headers = fingerprintX402RequestHeaders(init?.headers);
+    const context = fingerprintX402RequestContext(init);
     if (readable !== undefined) {
-      return `${encodeX402KeyField(readable)}${encodeX402KeyField(headers)}`;
+      return `${encodeX402KeyField(readable)}${encodeX402KeyField(context)}`;
     }
     const body = init?.body;
     if (typeof FormData !== 'undefined' && body instanceof FormData) {
-      return `${encodeX402KeyField(this.fingerprintFormData(body))}${encodeX402KeyField(headers)}`;
+      return `${encodeX402KeyField(this.fingerprintFormData(body))}${encodeX402KeyField(context)}`;
     }
     if (body === undefined || body === null || typeof body !== 'object') {
-      return `${encodeX402KeyField('')}${encodeX402KeyField(headers)}`;
+      return `${encodeX402KeyField('')}${encodeX402KeyField(context)}`;
     }
     const existing = this.unreadableRequestIds.get(body);
     if (existing) {
-      return `${encodeX402KeyField(existing)}${encodeX402KeyField(headers)}`;
+      return `${encodeX402KeyField(existing)}${encodeX402KeyField(context)}`;
     }
     const id = `o:${this.nextUnkeyedIntentId()}`;
     this.unreadableRequestIds.set(body, id);
-    return `${encodeX402KeyField(id)}${encodeX402KeyField(headers)}`;
+    return `${encodeX402KeyField(id)}${encodeX402KeyField(context)}`;
   }
 
   /** Snapshot FormData entries before fetch can yield and callers can mutate them. */
@@ -814,10 +831,7 @@ export class X402Client {
         throw receiptError;
       }
       entry.status = 'unknown';
-      if (entry.unkeyed) {
-        throw receiptError;
-      }
-      return result;
+      throw receiptError;
     }
     this.markSettlementConfirmed(entry);
     return result;
@@ -852,7 +866,7 @@ export class X402Client {
       }
     })();
     entry.promise = pending;
-    const observed = await this.observeSettledPayment(pending, true);
+    const observed = await this.observeSettledPayment(pending, false);
     return observed ? { ...observed, entry } : null;
   }
 
@@ -1033,29 +1047,17 @@ export class X402Client {
       if (existing.status === 'queued' && existing.txHash) {
         this.throwObservedQueued(existing.txHash);
       }
-      if (existing.status === 'unknown' && existing.txHash && existing.unverifiedReplacement) {
+      if (existing.status === 'confirmed' && existing.txHash) {
+        return { txHash: existing.txHash, replayed: true, entry: existing };
+      }
+      if (existing.status === 'reverted' && existing.txHash) {
+        this.throwObservedRevert(key, existing, existing.txHash);
+      }
+      if (existing.status === 'unknown' && existing.txHash) {
+        // The first receipt wait may have rejected, so never await its rejected
+        // promise here. Reconfirm the saved transaction hash before emitting
+        // any proof for either explicit or unkeyed settlements.
         const confirmation = await this.confirmSubmittedSettlement(key, existing.txHash);
-        if (confirmation === 'queued' && existing.txHash) {
-          this.throwObservedQueued(existing.txHash);
-        }
-        if (confirmation === 'reverted') {
-          this.throwObservedRevert(key, existing, existing.txHash);
-        }
-        if (confirmation === 'confirmed' && existing.txHash) {
-          return {
-            txHash: existing.txHash,
-            replayed: true,
-            entry: existing,
-          };
-        }
-        throw new X402SettlementUnknownError(existing.txHash);
-      }
-      const observed = await this.observeSettledPayment(existing.promise, true);
-      if (!observed) {
-        return null;
-      }
-      if (existing.status === 'unknown') {
-        const confirmation = await this.confirmSubmittedSettlement(key, observed.txHash);
         if (confirmation === 'confirmed' && existing.txHash) {
           return { txHash: existing.txHash, replayed: true, entry: existing };
         }
@@ -1065,14 +1067,11 @@ export class X402Client {
         if (confirmation === 'reverted' && existing.txHash) {
           this.throwObservedRevert(key, existing, existing.txHash);
         }
-        if (existing.unverifiedReplacement) {
-          throw new X402SettlementUnknownError(existing.txHash ?? observed.txHash);
-        }
-        return {
-          txHash: existing.txHash ?? observed.txHash,
-          replayed: observed.replayed,
-          entry: existing,
-        };
+        throw new X402SettlementUnknownError(existing.txHash);
+      }
+      const observed = await this.observeSettledPayment(existing.promise, true);
+      if (!observed) {
+        return null;
       }
       if (existing.status === 'queued' && existing.txHash) {
         this.throwObservedQueued(existing.txHash);

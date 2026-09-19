@@ -237,6 +237,8 @@ describe('X402Client protocol-fee phase (#50)', () => {
     expect(transfer.mock.calls.filter((call) => isFeeTransfer(call[1]))).toHaveLength(1);
     expect(feeReceiptAttempts).toBe(2);
     expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
+    expect(client.getTransactionLog()).toHaveLength(1);
+    expect(client.getTransactionLog()[0].replayed).toBe(false);
   });
 
   it('single-flights concurrent retries while an unkeyed fee receipt is pending', async () => {
@@ -278,6 +280,9 @@ describe('X402Client protocol-fee phase (#50)', () => {
     expect(feeReceiptAttempts).toBe(2);
     expect(transfer.mock.calls.filter((call) => isFeeTransfer(call[1]))).toHaveLength(1);
     expect(transfer.mock.calls.filter((call) => !isFeeTransfer(call[1]))).toHaveLength(1);
+    const logs = client.getTransactionLog();
+    expect(logs).toHaveLength(2);
+    expect(logs.filter((log) => log.replayed)).toHaveLength(1);
   });
 
   it('keeps a replaced fee reserved and never presents it as payment proof', async () => {
