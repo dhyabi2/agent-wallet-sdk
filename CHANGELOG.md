@@ -1,3 +1,10 @@
+## [6.2.1] — 2026-09-19
+
+### Documentation
+- Clarified that the published npm package name is `agentwallet-sdk` (not the GitHub repository name `agent-wallet-sdk`) and restated that the package is non-custodial.
+
+---
+
 ## [6.2.0] — 2026-04-13
 
 ### Added
