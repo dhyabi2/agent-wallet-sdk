@@ -16,6 +16,7 @@
 - Keep optional-chain dependencies lazy so core EVM use does not require them.
 - Pair behavioral changes with tests in the nearest existing test directory.
 - Keep public exports and generated declaration output consistent.
+- X402 settlements must bind proof to a call-time request snapshot and retain unresolved payee or protocol-fee phases with their reservation; unknown or queued phases never authorize another transfer or become `X-PAYMENT` proof.
 
 ## Work Guidance
 

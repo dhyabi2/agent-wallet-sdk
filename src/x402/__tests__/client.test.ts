@@ -12,6 +12,7 @@ import {
   buildUnkeyedPendingKey,
   canonicalizeX402Amount,
   canonicalizeX402RequestUrl,
+  fingerprintX402RequestHeaders,
   fingerprintReadableX402RequestBody,
   x402SettlementReceiptIsQueued,
   X402_MAX_UNCONFIRMED_SETTLEMENTS,
@@ -22,6 +23,10 @@ import {
 } from '../client.js';
 import { USDC_ADDRESSES } from '../types.js';
 import type { X402PaymentRequired, X402PaymentRequirements } from '../types.js';
+
+type X402ClientPaymentInternals = {
+  executePayment: (...args: unknown[]) => Promise<{ txHash: `0x${string}` }>;
+};
 
 // Mock wallet (we test protocol logic, not on-chain execution).
 // Settlements stay in-flight until publicClient confirms the receipt.
@@ -498,6 +503,7 @@ describe('X402Client retry idempotency', () => {
     const logs = client.getTransactionLog();
     expect(logs).toHaveLength(2);
     expect(logs.filter((log) => log.replayed).length).toBe(1);
+    expect(logs[0].idempotencyKey).toBe(logs[1].idempotencyKey);
     expect(client.getDailySpendSummary().global).toBe(1000000n);
   });
 
@@ -510,7 +516,10 @@ describe('X402Client retry idempotency', () => {
     const gate = new Promise<{ txHash: `0x${string}` }>((resolve) => {
       release = resolve;
     });
-    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+    const executeSpy = vi.spyOn(
+      X402Client.prototype as unknown as X402ClientPaymentInternals,
+      'executePayment',
+    )
       .mockReturnValue(gate);
     const approvals: string[] = [];
     mock402ThenPaid();
@@ -544,7 +553,10 @@ describe('X402Client retry idempotency', () => {
   });
 
   it('does not reuse settlement across independent calls without an explicit intent', async () => {
-    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+    const executeSpy = vi.spyOn(
+      X402Client.prototype as unknown as X402ClientPaymentInternals,
+      'executePayment',
+    )
       .mockResolvedValue({ txHash });
     const approvals: string[] = [];
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
@@ -604,7 +616,10 @@ describe('X402Client retry idempotency', () => {
     const gate = new Promise<{ txHash: `0x${string}` }>((resolve) => {
       release = resolve;
     });
-    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+    const executeSpy = vi.spyOn(
+      X402Client.prototype as unknown as X402ClientPaymentInternals,
+      'executePayment',
+    )
       .mockReturnValue(gate);
     const approvals: string[] = [];
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
@@ -648,6 +663,7 @@ describe('X402Client retry idempotency', () => {
     const logs = client.getTransactionLog();
     expect(logs).toHaveLength(2);
     expect(logs.filter((log) => log.replayed).length).toBe(1);
+    expect(logs[0].idempotencyKey).toBe(logs[1].idempotencyKey);
     expect(client.getDailySpendSummary().global).toBe(1000000n);
   });
 
@@ -758,7 +774,76 @@ describe('X402Client retry idempotency', () => {
     const logs = client.getTransactionLog();
     expect(logs).toHaveLength(2);
     expect(logs.filter((log) => log.replayed).length).toBe(1);
+    expect(logs[0].idempotencyKey).toBe(logs[1].idempotencyKey);
     expect(client.getDailySpendSummary().global).toBe(1000000n);
+  });
+
+  it('single-flights concurrent unkeyed POSTs sharing a FormData file', async () => {
+    const executeSpy = vi.spyOn(
+      X402Client.prototype as unknown as X402ClientPaymentInternals,
+      'executePayment',
+    ).mockResolvedValue({ txHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      if (new Headers(init?.headers).has('X-PAYMENT')) {
+        return new Response('paid', { status: 200 });
+      }
+      const unkeyed = paymentRequired();
+      delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+      });
+    });
+    const client = new X402Client(mockWallet, { globalDailyLimit: 1000000n });
+    const body = new FormData();
+    body.append('file', new Blob(['x'], { type: 'text/plain' }), 'proof.txt');
+
+    const responses = await Promise.all([
+      client.fetch(url, { method: 'POST', body }),
+      client.fetch(url, { method: 'POST', body }),
+    ]);
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    const logs = client.getTransactionLog();
+    expect(logs).toHaveLength(2);
+    expect(logs.filter((log) => log.replayed).length).toBe(1);
+    expect(logs[0].idempotencyKey).toBe(logs[1].idempotencyKey);
+    expect(client.getDailySpendSummary().global).toBe(1000000n);
+  });
+
+  it('does not coalesce same-body unkeyed requests from distinct callers', async () => {
+    const executeSpy = vi.spyOn(
+      X402Client.prototype as unknown as X402ClientPaymentInternals,
+      'executePayment',
+    )
+      .mockResolvedValue({ txHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      if (new Headers(init?.headers).has('X-PAYMENT')) {
+        return new Response('paid', { status: 200 });
+      }
+      const unkeyed = paymentRequired();
+      delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+      });
+    });
+    const client = new X402Client(mockWallet, { globalDailyLimit: 2000000n });
+    const body = JSON.stringify({ sku: 'alpha' });
+
+    const responses = await Promise.all([
+      client.fetch(url, {
+        method: 'POST', body, headers: { Authorization: 'Bearer caller-a', 'Idempotency-Key': 'a' },
+      }),
+      client.fetch(url, {
+        method: 'POST', body, headers: { authorization: 'Bearer caller-b', 'Idempotency-Key': 'b' },
+      }),
+    ]);
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+    expect(client.getDailySpendSummary().global).toBe(2000000n);
   });
 
   it('scopes unkeyed pending keys to readable request identity', () => {
@@ -774,6 +859,228 @@ describe('X402Client retry idempotency', () => {
     expect(buildUnkeyedPendingKey('POST', url, terms, '')).toBe(
       buildUnkeyedPendingKey('POST', url, terms),
     );
+  });
+
+  it('normalizes header identity without retaining caller values in the key', () => {
+    const record = fingerprintX402RequestHeaders({
+      Authorization: 'Bearer caller-a',
+      'Idempotency-Key': 'request-a',
+      'X-Tenant': 'tenant-a',
+    });
+    const tuples = fingerprintX402RequestHeaders([
+      ['x-tenant', 'tenant-a'],
+      ['idempotency-key', 'request-a'],
+      ['authorization', 'Bearer caller-a'],
+    ]);
+    const distinct = fingerprintX402RequestHeaders({
+      Authorization: 'Bearer caller-b',
+      'Idempotency-Key': 'request-b',
+      'X-Tenant': 'tenant-b',
+    });
+
+    expect(record).toBe(tuples);
+    expect(record).not.toBe(distinct);
+    expect(record).not.toContain('caller-a');
+    expect(record).not.toContain('request-a');
+  });
+
+  it('snapshots mutable request bodies before the challenged fetch yields', async () => {
+    let releaseFirstChallenge: (response: Response) => void = () => {};
+    const firstChallenge = new Promise<Response>((resolve) => { releaseFirstChallenge = resolve; });
+    let challenges = 0;
+    const executeSpy = vi.spyOn(
+      X402Client.prototype as unknown as X402ClientPaymentInternals,
+      'executePayment',
+    )
+      .mockResolvedValue({ txHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      if (new Headers(init?.headers).has('X-PAYMENT')) {
+        return new Response('paid', { status: 200 });
+      }
+      challenges += 1;
+      if (challenges === 1) {
+        return firstChallenge;
+      }
+      const unkeyed = paymentRequired();
+      delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+      });
+    });
+    const client = new X402Client(mockWallet, { globalDailyLimit: 2000000n });
+    const firstBody = new URLSearchParams({ sku: 'alpha' });
+    const first = client.fetch(url, { method: 'POST', body: firstBody });
+    await vi.waitFor(() => expect(challenges).toBe(1));
+    firstBody.set('sku', 'beta');
+    const second = client.fetch(url, { method: 'POST', body: new URLSearchParams({ sku: 'beta' }) });
+    const unkeyed = paymentRequired();
+    delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+    releaseFirstChallenge(new Response(null, {
+      status: 402,
+      headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+    }));
+
+    const responses = await Promise.all([first, second]);
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('snapshots mutable request headers before the challenged fetch yields', async () => {
+    let releaseFirstChallenge: (response: Response) => void = () => {};
+    const firstChallenge = new Promise<Response>((resolve) => { releaseFirstChallenge = resolve; });
+    let challenges = 0;
+    const executeSpy = vi.spyOn(
+      X402Client.prototype as unknown as X402ClientPaymentInternals,
+      'executePayment',
+    )
+      .mockResolvedValue({ txHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      if (new Headers(init?.headers).has('X-PAYMENT')) {
+        return new Response('paid', { status: 200 });
+      }
+      challenges += 1;
+      if (challenges === 1) {
+        return firstChallenge;
+      }
+      const unkeyed = paymentRequired();
+      delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+      });
+    });
+    const client = new X402Client(mockWallet, { globalDailyLimit: 2000000n });
+    const headers = new Headers({ Authorization: 'Bearer caller-a' });
+    const first = client.fetch(url, { method: 'POST', body: 'same', headers });
+    await vi.waitFor(() => expect(challenges).toBe(1));
+    headers.set('Authorization', 'Bearer caller-b');
+    const second = client.fetch(url, {
+      method: 'POST', body: 'same', headers: { Authorization: 'Bearer caller-b' },
+    });
+    const unkeyed = paymentRequired();
+    delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+    releaseFirstChallenge(new Response(null, {
+      status: 402,
+      headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+    }));
+
+    const responses = await Promise.all([first, second]);
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('snapshots a mutable FormData body before the challenged fetch yields', async () => {
+    let releaseFirstChallenge: (response: Response) => void = () => {};
+    const firstChallenge = new Promise<Response>((resolve) => { releaseFirstChallenge = resolve; });
+    let challenges = 0;
+    const executeSpy = vi.spyOn(
+      X402Client.prototype as unknown as X402ClientPaymentInternals,
+      'executePayment',
+    ).mockResolvedValue({ txHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      if (new Headers(init?.headers).has('X-PAYMENT')) return new Response('paid', { status: 200 });
+      challenges += 1;
+      if (challenges === 1) return firstChallenge;
+      const unkeyed = paymentRequired();
+      delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+      return new Response(null, { status: 402, headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) } });
+    });
+    const client = new X402Client(mockWallet, { globalDailyLimit: 2000000n });
+    const firstBody = new FormData();
+    firstBody.append('sku', 'alpha');
+    const first = client.fetch(url, { method: 'POST', body: firstBody });
+    await vi.waitFor(() => expect(challenges).toBe(1));
+    firstBody.set('sku', 'beta');
+    const secondBody = new FormData();
+    secondBody.append('sku', 'beta');
+    const second = client.fetch(url, { method: 'POST', body: secondBody });
+    const unkeyed = paymentRequired();
+    delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+    releaseFirstChallenge(new Response(null, {
+      status: 402, headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+    }));
+
+    await Promise.all([first, second]);
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('snapshots a mutable method before the challenged fetch yields', async () => {
+    let releaseFirstChallenge: (response: Response) => void = () => {};
+    const firstChallenge = new Promise<Response>((resolve) => { releaseFirstChallenge = resolve; });
+    let challenges = 0;
+    const executeSpy = vi.spyOn(
+      X402Client.prototype as unknown as X402ClientPaymentInternals,
+      'executePayment',
+    ).mockResolvedValue({ txHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      if (new Headers(init?.headers).has('X-PAYMENT')) return new Response('paid', { status: 200 });
+      challenges += 1;
+      if (challenges === 1) return firstChallenge;
+      const unkeyed = paymentRequired();
+      delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+      return new Response(null, { status: 402, headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) } });
+    });
+    const client = new X402Client(mockWallet, { globalDailyLimit: 2000000n });
+    const firstInit: RequestInit = { method: 'POST', body: 'same' };
+    const first = client.fetch(url, firstInit);
+    await vi.waitFor(() => expect(challenges).toBe(1));
+    firstInit.method = 'PUT';
+    const second = client.fetch(url, { method: 'PUT', body: 'same' });
+    const unkeyed = paymentRequired();
+    delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+    releaseFirstChallenge(new Response(null, {
+      status: 402, headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+    }));
+
+    await Promise.all([first, second]);
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses the original request snapshot for the paid retry after caller mutation', async () => {
+    let releaseChallenge: (response: Response) => void = () => {};
+    const challenge = new Promise<Response>((resolve) => { releaseChallenge = resolve; });
+    const observed: Array<{ url: string; method: string; authorization: string | null; body: string }> = [];
+    const executeSpy = vi.spyOn(
+      X402Client.prototype as unknown as X402ClientPaymentInternals,
+      'executePayment',
+    ).mockResolvedValue({ txHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const body = init?.body;
+      observed.push({
+        url: String(input),
+        method: String(init?.method),
+        authorization: new Headers(init?.headers).get('authorization'),
+        body: body instanceof URLSearchParams ? body.toString() : String(body ?? ''),
+      });
+      if (!new Headers(init?.headers).has('X-PAYMENT')) return challenge;
+      return new Response('paid', { status: 200 });
+    });
+    const requestUrl = new URL(url);
+    const body = new URLSearchParams({ sku: 'alpha' });
+    const headers = new Headers({ Authorization: 'Bearer caller-a' });
+    const requestInit: RequestInit = { method: 'POST', headers, body };
+    const client = new X402Client(mockWallet);
+    const pending = client.fetch(requestUrl, requestInit);
+    await vi.waitFor(() => expect(observed).toHaveLength(1));
+
+    requestUrl.pathname = '/mutated';
+    requestInit.method = 'PUT';
+    headers.set('Authorization', 'Bearer caller-b');
+    body.set('sku', 'beta');
+    const unkeyed = paymentRequired();
+    delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+    releaseChallenge(new Response(null, {
+      status: 402, headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+    }));
+
+    expect((await pending).status).toBe(200);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(observed).toHaveLength(2);
+    expect(observed).toEqual([
+      expect.objectContaining({ url, method: 'POST', authorization: 'Bearer caller-a', body: 'sku=alpha' }),
+      expect.objectContaining({ url, method: 'POST', authorization: 'Bearer caller-a', body: 'sku=alpha' }),
+    ]);
   });
 
   it('fails closed when the same explicit intent returns different payment terms', async () => {
@@ -1389,12 +1696,58 @@ describe('X402Client retry idempotency', () => {
     await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
       X402SettlementQueuedError,
     );
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toMatchObject({
+      txHash: replacedHash,
+    });
     expect(executeSpy).toHaveBeenCalledTimes(1);
     expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
     await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
       X402SettlementQueuedError,
     );
     expect(executeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not emit proof when retry confirmation discovers a replacement', async () => {
+    const replacedHash = ('0x' + '22'.repeat(32)) as `0x${string}`;
+    let attempts = 0;
+    const waitReceipt = vi.fn(async ({
+      onReplaced,
+    }: {
+      hash: string;
+      onReplaced?: (event: {
+        reason: string;
+        transactionReceipt: { status: string; transactionHash: string };
+      }) => void;
+    }) => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error('temporary receipt outage');
+      }
+      onReplaced?.({
+        reason: 'replaced',
+        transactionReceipt: { status: 'success', transactionHash: replacedHash },
+      });
+      return { status: 'success', transactionHash: replacedHash };
+    });
+    const wallet = { publicClient: { waitForTransactionReceipt: waitReceipt } };
+    const executeSpy = vi.spyOn(
+      X402Client.prototype as unknown as X402ClientPaymentInternals,
+      'executePayment',
+    )
+      .mockResolvedValue({ txHash });
+    const fetchSpy = mock402ThenPaid();
+    const client = new X402Client(wallet, { globalDailyLimit: 1000000n });
+
+    expect((await client.fetch(url, { method: 'POST' })).status).toBe(200);
+    await expect(client.fetch(url, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402SettlementUnknownError,
+    );
+
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(1000000n);
+    expect(
+      fetchSpy.mock.calls.filter(([, init]) => new Headers(init?.headers).has('X-PAYMENT')),
+    ).toHaveLength(1);
   });
 
   it('keeps a hash-mismatch without onReplaced as unknown so a retry cannot double-pay', async () => {
@@ -2372,4 +2725,3 @@ describe('X402Client retry idempotency', () => {
     expect(rootBarrel.X402SettlementBacklogError).toBe(X402SettlementBacklogError);
   });
 });
-
