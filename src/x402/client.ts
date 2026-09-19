@@ -217,7 +217,7 @@ export function buildX402PaymentTermsFingerprint(req: X402PaymentRequirements): 
 export function fingerprintReadableX402RequestBody(
   body: BodyInit | null | undefined,
 ): string | undefined {
-  if (body == null) {
+  if (body === null || body === undefined) {
     return '';
   }
   if (typeof body === 'string') {
