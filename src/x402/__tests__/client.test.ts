@@ -9,8 +9,10 @@ import {
   X402SettlementUnknownError,
   buildX402PaymentIdempotencyKey,
   buildX402PaymentIntentKey,
+  buildUnkeyedPendingKey,
   canonicalizeX402Amount,
   canonicalizeX402RequestUrl,
+  fingerprintReadableX402RequestBody,
   x402SettlementReceiptIsQueued,
   X402_MAX_UNCONFIRMED_SETTLEMENTS,
   X402_RECONFIRM_BACKOFF_MS,
@@ -591,6 +593,187 @@ describe('X402Client retry idempotency', () => {
     expect(logs[1].replayed).toBe(false);
     expect(logs[0].idempotencyKey).not.toBe(logs[1].idempotencyKey);
     expect(client.getDailySpendSummary().global).toBe(2000000n);
+  });
+
+  it('keeps concurrent unkeyed fetches on one in-flight settlement', async () => {
+    let releasePolicy: (value: boolean) => void = () => {};
+    const policyGate = new Promise<boolean>((resolve) => {
+      releasePolicy = resolve;
+    });
+    let release: (value: { txHash: `0x${string}` }) => void = () => {};
+    const gate = new Promise<{ txHash: `0x${string}` }>((resolve) => {
+      release = resolve;
+    });
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockReturnValue(gate);
+    const approvals: string[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      if (headers.get('X-PAYMENT')) {
+        return new Response('paid', { status: 200 });
+      }
+      const unkeyed = paymentRequired();
+      delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+      });
+    });
+    const client = new X402Client(mockWallet, {
+      globalDailyLimit: 1000000n,
+      onBeforePayment: async () => {
+        approvals.push('checked');
+        return policyGate;
+      },
+    });
+
+    const pending = Promise.all([
+      client.fetch(url, { method: 'POST' }),
+      client.fetch(url, { method: 'POST' }),
+    ]);
+    await vi.waitFor(() => {
+      expect(approvals).toEqual(['checked']);
+    });
+    expect(executeSpy).toHaveBeenCalledTimes(0);
+    releasePolicy(true);
+    await vi.waitFor(() => {
+      expect(executeSpy).toHaveBeenCalledTimes(1);
+    });
+    release({ txHash });
+    const responses = await pending;
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    expect(approvals).toEqual(['checked']);
+    const logs = client.getTransactionLog();
+    expect(logs).toHaveLength(2);
+    expect(logs.filter((log) => log.replayed).length).toBe(1);
+    expect(client.getDailySpendSummary().global).toBe(1000000n);
+  });
+
+  it('does not transfer again when an unkeyed receipt is still pending', async () => {
+    let releaseReceipt: (value: { status: string }) => void = () => {};
+    const receiptGate = new Promise<{ status: string }>((resolve) => {
+      releaseReceipt = resolve;
+    });
+    const waitReceipt = vi.fn(() => receiptGate);
+    const wallet = {
+      publicClient: { waitForTransactionReceipt: waitReceipt },
+    } as any;
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      if (headers.get('X-PAYMENT')) {
+        return new Response('paid', { status: 200 });
+      }
+      const unkeyed = paymentRequired();
+      delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+      });
+    });
+    const client = new X402Client(wallet, { globalDailyLimit: 1000000n });
+
+    const first = client.fetch(url, { method: 'POST' });
+    await vi.waitFor(() => {
+      expect(executeSpy).toHaveBeenCalledTimes(1);
+      expect(waitReceipt).toHaveBeenCalledTimes(1);
+    });
+
+    const second = client.fetch(url, { method: 'POST' });
+    await vi.waitFor(() => {
+      expect(waitReceipt).toHaveBeenCalledTimes(1);
+    });
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+
+    releaseReceipt({ status: 'success' });
+    const responses = await Promise.all([first, second]);
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    const logs = client.getTransactionLog();
+    expect(logs).toHaveLength(2);
+    expect(logs.filter((log) => log.replayed).length).toBe(1);
+    expect(client.getDailySpendSummary().global).toBe(1000000n);
+  });
+
+  it('does not coalesce concurrent unkeyed POSTs with different bodies', async () => {
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      if (headers.get('X-PAYMENT')) {
+        return new Response('paid', { status: 200 });
+      }
+      const unkeyed = paymentRequired();
+      delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+      });
+    });
+    const client = new X402Client(mockWallet, { globalDailyLimit: 2000000n });
+
+    const responses = await Promise.all([
+      client.fetch(url, { method: 'POST', body: JSON.stringify({ sku: 'alpha' }) }),
+      client.fetch(url, { method: 'POST', body: JSON.stringify({ sku: 'beta' }) }),
+    ]);
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(executeSpy).toHaveBeenCalledTimes(2);
+    const logs = client.getTransactionLog();
+    expect(logs).toHaveLength(2);
+    expect(logs.every((log) => log.replayed === false)).toBe(true);
+    expect(logs[0].idempotencyKey).not.toBe(logs[1].idempotencyKey);
+    expect(client.getDailySpendSummary().global).toBe(2000000n);
+  });
+
+  it('single-flights concurrent unkeyed POSTs that share a body', async () => {
+    const executeSpy = vi.spyOn(X402Client.prototype as any, 'executePayment')
+      .mockResolvedValue({ txHash });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      const headers = new Headers(init?.headers);
+      if (headers.get('X-PAYMENT')) {
+        return new Response('paid', { status: 200 });
+      }
+      const unkeyed = paymentRequired();
+      delete (unkeyed.accepts[0] as { extra?: unknown }).extra;
+      return new Response(null, {
+        status: 402,
+        headers: { 'payment-required': btoa(JSON.stringify(unkeyed)) },
+      });
+    });
+    const client = new X402Client(mockWallet, { globalDailyLimit: 1000000n });
+    const body = JSON.stringify({ sku: 'alpha' });
+
+    const responses = await Promise.all([
+      client.fetch(url, { method: 'POST', body }),
+      client.fetch(url, { method: 'POST', body }),
+    ]);
+
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(executeSpy).toHaveBeenCalledTimes(1);
+    const logs = client.getTransactionLog();
+    expect(logs).toHaveLength(2);
+    expect(logs.filter((log) => log.replayed).length).toBe(1);
+    expect(client.getDailySpendSummary().global).toBe(1000000n);
+  });
+
+  it('scopes unkeyed pending keys to readable request identity', () => {
+    const terms = 'terms';
+    expect(fingerprintReadableX402RequestBody(undefined)).toBe('');
+    expect(fingerprintReadableX402RequestBody('{"sku":"alpha"}'))
+      .not.toBe(fingerprintReadableX402RequestBody('{"sku":"beta"}'));
+    expect(
+      buildUnkeyedPendingKey('POST', url, terms, fingerprintReadableX402RequestBody('{"sku":"alpha"}')!),
+    ).not.toBe(
+      buildUnkeyedPendingKey('POST', url, terms, fingerprintReadableX402RequestBody('{"sku":"beta"}')!),
+    );
+    expect(buildUnkeyedPendingKey('POST', url, terms, '')).toBe(
+      buildUnkeyedPendingKey('POST', url, terms),
+    );
   });
 
   it('fails closed when the same explicit intent returns different payment terms', async () => {
