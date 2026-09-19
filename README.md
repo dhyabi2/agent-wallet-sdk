@@ -3,9 +3,9 @@
 [![npm](https://img.shields.io/npm/v/agentwallet-sdk?style=flat-square)](https://www.npmjs.com/package/agentwallet-sdk)
 [![CI](https://github.com/up2itnow0822/agent-wallet-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/up2itnow0822/agent-wallet-sdk/actions/workflows/ci.yml)
 
-AgentWallet SDK is a TypeScript library for policy-aware agent payments. It
-accepts a caller-supplied viem `WalletClient`; it does not store keys or provide
-a custodial service.
+The `agentwallet-sdk` npm package is a TypeScript library for policy-aware
+agent payments. It is non-custodial: callers supply their own viem
+`WalletClient`, and the SDK does not store keys or operate a custodial service.
 
 The current npm package is `agentwallet-sdk` v6.2.1.
 
