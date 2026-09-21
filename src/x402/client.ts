@@ -1570,25 +1570,27 @@ export class X402Client {
       );
     }
 
-    // First check on-chain budget
+    // First check on-chain budget against the full debit. The protocol fee is
+    // transferred before the payee, so a principal-only check can pass, charge
+    // the fee, then revert the payee and strand funds at the collector.
     const onChainBudget = await checkBudget(this.wallet, resolvedAddress);
     const amount = BigInt(req.amount);
-
-    if (amount > onChainBudget.perTxLimit) {
-      throw new X402PaymentError(
-        `Amount ${amount} exceeds on-chain per-tx limit ${onChainBudget.perTxLimit}`,
-        req
-      );
-    }
-
-    if (amount > onChainBudget.remainingInPeriod) {
-      throw new X402PaymentError(
-        `Amount ${amount} exceeds remaining period budget ${onChainBudget.remainingInPeriod}`,
-        req
-      );
-    }
-
     const feeAmount = (amount * X402_PROTOCOL_FEE_BPS) / 10000n;
+    const debit = amount + feeAmount;
+
+    if (debit > onChainBudget.perTxLimit) {
+      throw new X402PaymentError(
+        `Amount ${amount} plus protocol fee ${feeAmount} exceeds on-chain per-tx limit ${onChainBudget.perTxLimit}`,
+        req
+      );
+    }
+
+    if (debit > onChainBudget.remainingInPeriod) {
+      throw new X402PaymentError(
+        `Amount ${amount} plus protocol fee ${feeAmount} exceeds remaining period budget ${onChainBudget.remainingInPeriod}`,
+        req
+      );
+    }
 
     if (feeAmount > 0n) {
       if (intent) {

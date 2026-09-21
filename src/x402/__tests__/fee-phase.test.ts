@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   X402Client,
+  X402PaymentError,
   X402SettlementQueuedError,
   X402SettlementRevertedError,
   X402SettlementUnknownError,
@@ -107,6 +108,42 @@ describe('X402Client protocol-fee phase (#50)', () => {
     mock402ThenPaid(opts.unkeyed ? {} : undefined);
     return { wallet, feeHashes, payeeHashes };
   }
+
+  it('refuses both transfers when remaining on-chain budget cannot cover amount plus protocol fee', async () => {
+    const { wallet } = setupTransfers({
+      feeReceipts: ['success'],
+      payeeReceipts: ['success'],
+    });
+    onChainBudget.mockResolvedValue({
+      perTxLimit: 10n ** 18n,
+      remainingInPeriod: 1000000n,
+    });
+    const client = new X402Client(wallet);
+
+    await expect(client.fetch(URL, { method: 'POST' })).rejects.toBeInstanceOf(
+      X402PaymentError,
+    );
+    expect(transfer.mock.calls).toHaveLength(0);
+    expect(client.budgetTracker.getReservedSummary().global).toBe(0n);
+    expect(client.getTransactionLog()).toHaveLength(0);
+  });
+
+  it('allows a payment when remaining on-chain budget covers amount plus protocol fee', async () => {
+    const { wallet } = setupTransfers({
+      feeReceipts: ['success'],
+      payeeReceipts: ['success'],
+    });
+    onChainBudget.mockResolvedValue({
+      perTxLimit: 10n ** 18n,
+      remainingInPeriod: 1_007_700n,
+    });
+    const client = new X402Client(wallet);
+
+    expect((await client.fetch(URL, { method: 'POST' })).status).toBe(200);
+    expect(transfer.mock.calls).toHaveLength(2);
+    expect(isFeeTransfer(transfer.mock.calls[0][1])).toBe(true);
+    expect(isFeeTransfer(transfer.mock.calls[1][1])).toBe(false);
+  });
 
   it('does not re-charge the protocol fee after a payee revert on the same explicit intent', async () => {
     const { wallet, feeHashes, payeeHashes } = setupTransfers({
