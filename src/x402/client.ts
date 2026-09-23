@@ -25,7 +25,7 @@ import { DEFAULT_SUPPORTED_NETWORKS } from './types.js';
 import { X402BudgetTracker } from './budget.js';
 import { agentTransferToken, checkBudget } from '../index.js';
 import { resolveAssetAddress } from './multi-asset.js';
-import { toReplayableFetchArgs } from './fetch-args.js';
+import { toReplayableFetchArgs, withFailClosedRedirect } from './fetch-args.js';
 
 /**
  * keccak256("TransactionQueued(uint256,address,uint256,address,uint256)").
@@ -421,7 +421,7 @@ export class X402Client {
    */
   async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
     const { url, init: replayInit } = await toReplayableFetchArgs(input, init);
-    const requestInit = this.snapshotRequestInit(replayInit);
+    const requestInit = withFailClosedRedirect(this.snapshotRequestInit(replayInit), init);
     const requestUrl = url;
     const urlStr = canonicalizeX402RequestUrl(requestUrl);
     const response = await globalThis.fetch(requestUrl, requestInit);

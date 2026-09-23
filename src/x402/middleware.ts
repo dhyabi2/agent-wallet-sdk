@@ -1,7 +1,7 @@
 // [MAX-ADDED] x402 Middleware — wraps fetch/axios to be x402-aware
 import type { X402ClientConfig } from './types.js';
 import { X402Client } from './client.js';
-import { toReplayableFetchArgs } from './fetch-args.js';
+import { toReplayableFetchArgs, withFailClosedRedirect } from './fetch-args.js';
 
 /**
  * [MAX-ADDED] Create an x402-aware HTTP client.
@@ -57,12 +57,13 @@ export function wrapWithX402(
 
   return async (input: string | URL | Request, init?: RequestInit) => {
     const { url, init: replayInit } = await toReplayableFetchArgs(input, init);
-    const response = await fetchFn(url, replayInit);
+    const requestInit = withFailClosedRedirect(replayInit, init);
+    const response = await fetchFn(url, requestInit);
 
     if (response.status !== 402) {
       return response;
     }
 
-    return wrappedClient.settle402AndRetry(response, url, replayInit, fetchFn);
+    return wrappedClient.settle402AndRetry(response, url, requestInit, fetchFn);
   };
 }

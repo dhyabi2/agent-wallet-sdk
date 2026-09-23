@@ -238,4 +238,16 @@ describe('wrapWithX402', () => {
     expect(hops[0]).toMatchObject({ method: 'POST', body: payload, paid: false });
     expect(hops[1]).toMatchObject({ method: 'POST', body: payload, paid: true });
   });
+
+  it('does not follow redirects unless the caller opts in', async () => {
+    const fetchFn = vi.fn(
+      async (_input: string | URL | Request, _init?: RequestInit) => new Response(null, { status: 302 }),
+    );
+    const wrapped = wrapWithX402(fetchFn, wallet, { autoPay: false });
+
+    const response = await wrapped('https://api.example.com/orders');
+
+    expect(response.status).toBe(302);
+    expect(fetchFn.mock.calls[0]?.[1]?.redirect).toBe('manual');
+  });
 });
