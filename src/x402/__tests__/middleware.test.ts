@@ -240,12 +240,14 @@ describe('wrapWithX402', () => {
   });
 
   it('does not follow redirects unless the caller opts in', async () => {
-    const fetchFn = vi.fn(async () => new Response(null, { status: 302 })) as typeof globalThis.fetch;
+    const fetchFn = vi.fn(
+      async (_input: string | URL | Request, _init?: RequestInit) => new Response(null, { status: 302 }),
+    );
     const wrapped = wrapWithX402(fetchFn, wallet, { autoPay: false });
 
     const response = await wrapped('https://api.example.com/orders');
 
     expect(response.status).toBe(302);
-    expect(fetchFn.mock.calls[0][1]?.redirect).toBe('manual');
+    expect(fetchFn.mock.calls[0]?.[1]?.redirect).toBe('manual');
   });
 });
