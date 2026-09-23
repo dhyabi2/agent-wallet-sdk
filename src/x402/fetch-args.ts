@@ -81,3 +81,25 @@ export async function toReplayableFetchArgs(
   const request = init !== undefined ? new Request(input, withDuplex(init)) : input;
   return materializeRequest(request);
 }
+
+/**
+ * Auto-pay fetch must not follow redirects unless the caller opted in.
+ * Native fetch defaults to `follow`, which forwards Authorization to the
+ * redirected origin before the 402 origin check can refuse payment.
+ */
+export function withFailClosedRedirect(
+  init: RequestInit | undefined,
+  callerInit?: RequestInit,
+): RequestInit {
+  const next: RequestInit = { ...init };
+  if (
+    callerInit !== undefined
+    && Object.prototype.hasOwnProperty.call(callerInit, 'redirect')
+    && callerInit.redirect !== undefined
+  ) {
+    next.redirect = callerInit.redirect;
+    return next;
+  }
+  next.redirect = 'manual';
+  return next;
+}

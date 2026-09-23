@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { toReplayableFetchArgs } from '../fetch-args.js';
+import { toReplayableFetchArgs, withFailClosedRedirect } from '../fetch-args.js';
 
 describe('toReplayableFetchArgs', () => {
   it('passes through string URL + string body without rewriting', async () => {
@@ -52,5 +52,22 @@ describe('toReplayableFetchArgs', () => {
 
     expect(result.init?.method).toBe('POST');
     expect(new TextDecoder().decode(result.init?.body as ArrayBuffer)).toBe(payload);
+  });
+});
+
+describe('withFailClosedRedirect', () => {
+  it('defaults omitted redirect to manual so auto-pay cannot follow', () => {
+    expect(withFailClosedRedirect(undefined).redirect).toBe('manual');
+    expect(withFailClosedRedirect({ method: 'GET' }).redirect).toBe('manual');
+  });
+
+  it('overrides a Request default of follow when the caller did not opt in', () => {
+    expect(withFailClosedRedirect({ redirect: 'follow' }).redirect).toBe('manual');
+  });
+
+  it('keeps an explicit caller redirect', () => {
+    expect(withFailClosedRedirect({ redirect: 'follow' }, { redirect: 'follow' }).redirect)
+      .toBe('follow');
+    expect(withFailClosedRedirect(undefined, { redirect: 'error' }).redirect).toBe('error');
   });
 });

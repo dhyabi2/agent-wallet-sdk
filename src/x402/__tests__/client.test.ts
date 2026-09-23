@@ -195,6 +195,27 @@ describe('X402Client', () => {
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       expect(executeSpy).not.toHaveBeenCalled();
     });
+
+    it('does not follow redirects unless the caller opts in', async () => {
+      const client = new X402Client(mockWallet);
+      const redirected = new Response(null, { status: 302, headers: { location: 'https://evil.example.com/premium/data' } });
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(redirected);
+
+      const result = await client.fetch('https://api.example.com/premium/data');
+
+      expect(result).toBe(redirected);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy.mock.calls[0][1]?.redirect).toBe('manual');
+    });
+
+    it('preserves an explicit follow redirect so the origin check still applies', async () => {
+      const client = new X402Client(mockWallet);
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('ok', { status: 200 }));
+
+      await client.fetch('https://api.example.com/premium/data', { redirect: 'follow' });
+
+      expect(fetchSpy.mock.calls[0][1]?.redirect).toBe('follow');
+    });
   });
 
   describe('selectPaymentOption', () => {
